@@ -13,7 +13,7 @@ const TYPE_ID = {
 function typeIconHtml(type) {
   const id = TYPE_ID[type];
   if (id === undefined) return '';
-  return `<img src="./type/${id}.png" alt="" class="move-row-type-icon" onerror="this.style.display='none'">`;
+  return `<img src="./type${id}.png" alt="" class="move-row-type-icon" onerror="this.style.display='none'">`;
 }
 
 const state = {
@@ -139,8 +139,17 @@ const MSG_AUTO_MS = 750;
 const LOG_STACK_MAX = 5;
 let logLines = [];
 
-function queueMessage(text, after) {
+function queueMessage(text, after, netMeta) {
   msgQueue.push({ text, after });
+  // ホスト → ゲストへイベントを即時送信（ホストの演出テンポとゲストの受信をリアルタイム同期させる）
+  if (state.multiplayer && state.isHost) {
+    Net.pushEvent({
+      k: 'msg', t: text,
+      h: netMeta && netMeta.hit ? netMeta.hit : null,
+      hp: netMeta && netMeta.hp !== undefined ? netMeta.hp : null,
+      f: netMeta && netMeta.faint ? netMeta.faint : null,
+    });
+  }
 }
 function hideMessageToast() {}
 function pushLogLine(text) {
@@ -907,16 +916,11 @@ function makeLogFn() {
         const poke = meta.hit === 'player' ? state.playerActive : state.cpuActive;
         updateHud(poke, uiSide, hpSnapshot);
       }
+    }, {
+      hit: meta && meta.hit ? meta.hit : null,
+      hp: hpSnapshot,
+      faint: meta && meta.faint ? meta.faint : null,
     });
-    // ホスト → ゲストへのイベント収集
-    if (state.multiplayer && state.isHost) {
-      state.mpHostEvents.push({
-        k: 'msg', t: text,
-        h: meta && meta.hit ? meta.hit : null,
-        hp: hpSnapshot,
-        f: meta && meta.faint ? meta.faint : null,
-      });
-    }
   };
 }
 
@@ -1273,6 +1277,33 @@ function startNextCpuBattle() {
 /* ---------------- Initial pick ---------------- */
 let pickPool = [];
 let pickedIds = [];
+let pickTimerInterval = null;
+const PICK_TIME_LIMIT = 30;
+
+function clearPickTimer() {
+  if (pickTimerInterval) { clearInterval(pickTimerInterval); pickTimerInterval = null; }
+  $('pick-timer-badge').style.display = 'none';
+  $('pick-timer-badge').classList.remove('warn');
+}
+
+function startPickTimer(onTimeout) {
+  clearPickTimer();
+  let remaining = PICK_TIME_LIMIT;
+  const badge = $('pick-timer-badge');
+  const num = $('pick-timer-num');
+  badge.style.display = 'flex';
+  badge.classList.remove('warn');
+  num.textContent = String(remaining);
+  pickTimerInterval = setInterval(() => {
+    remaining -= 1;
+    num.textContent = String(Math.max(0, remaining));
+    if (remaining <= 10) badge.classList.add('warn');
+    if (remaining <= 0) {
+      clearPickTimer();
+      onTimeout();
+    }
+  }, 1000);
+}
 
 function pickCardHtml(poke, idx) {
   const t1 = poke.species.type1, t2 = poke.species.type2;
@@ -1296,10 +1327,11 @@ function pickCardHtml(poke, idx) {
 function renderPickRow() {
   $('pick-row').innerHTML = pickPool.map((p, idx) => pickCardHtml(p, idx)).join('');
   $('pick-count').textContent = `${pickedIds.length} / 3 選択中`;
-  $('btn-pick-confirm').disabled = pickedIds.length !== 3;
+  $('btn-pick-confirm').disabled = state.multiplayer ? false : pickedIds.length !== 3;
 }
 
 function showInitialPickOverlay() {
+  clearPickTimer();
   const ids = [...getFinalSpeciesIds()].sort(() => Math.random() - 0.5).slice(0, 6);
   pickPool = ids.map((id) => createRandomPokemon(id, 100));
   pickedIds = [];
@@ -1326,15 +1358,27 @@ $('pick-row').addEventListener('click', (e) => {
   renderPickRow();
 });
 
-$('btn-pick-confirm').addEventListener('click', () => {
-  if (pickedIds.length !== 3) return;
-  state.playerTeam = pickedIds.map((idx) => pickPool[idx]);
+function confirmPick() {
+  clearPickTimer();
+  // 未選択が残っている場合は左（先頭）から自動補完
+  if (pickedIds.length < 3) {
+    for (let i = 0; i < pickPool.length && pickedIds.length < 3; i++) {
+      if (!pickedIds.includes(i)) pickedIds.push(i);
+    }
+  }
+  state.playerTeam = pickedIds.slice(0, 3).map((idx) => pickPool[idx]);
   $('pick-overlay').classList.remove('show');
   if (state.multiplayer) {
     onMultiplayerPickConfirm();
   } else {
     renderReorderScreen();
   }
+}
+
+$('btn-pick-confirm').addEventListener('click', () => {
+  if (state.multiplayer) { confirmPick(); return; }
+  if (pickedIds.length !== 3) return;
+  confirmPick();
 });
 
 /* ---------------- Team reorder screen ---------------- */
@@ -1518,12 +1562,250 @@ function startMultiplayerPick() {
   pickedIds = [];
   renderPickRow();
   $('pick-overlay').classList.add('show');
+  startPickTimer(() => { confirmPick(); });
+}
+
+/* =========================================================
+   選出後の交換フェーズ（対人戦のみ）
+   手持ち1/2/3 → 決定 / 入れ替える / 手持ちを変える（最大5回）
+   ========================================================= */
+const NEGO_TIME_LIMIT = 30;
+const NEGO_SWAP_MAX = 5;
+let negoTimerInterval = null;
+let negoSwapsLeft = NEGO_SWAP_MAX;
+let negoArmedIdx = null;
+
+function clearNegoTimer() {
+  if (negoTimerInterval) { clearInterval(negoTimerInterval); negoTimerInterval = null; }
+}
+
+function startNegoTimer(onTimeout) {
+  clearNegoTimer();
+  let remaining = NEGO_TIME_LIMIT;
+  const badge = $('nego-timer-badge');
+  const num = $('nego-timer-num');
+  badge.classList.remove('warn');
+  num.textContent = String(remaining);
+  negoTimerInterval = setInterval(() => {
+    remaining -= 1;
+    num.textContent = String(Math.max(0, remaining));
+    if (remaining <= 10) badge.classList.add('warn');
+    if (remaining <= 0) {
+      clearNegoTimer();
+      onTimeout();
+    }
+  }, 1000);
+}
+
+function negoCardHtml(p, idx) {
+  const effectiveTypes = getEffectiveTypesForDisplay(p);
+  const typeDisplay = effectiveTypes.map(t => `
+    <span class="type-chip ${TYPE_CLASS(t)}">${typeJp(t)}</span>
+  `).join('');
+  return `
+    <div class="trade-poke-card" data-idx="${idx}">
+      <button class="tpc-info-btn" data-info-idx="${idx}" type="button"><span>!</span></button>
+      <img src="./${p.speciesId}.png" alt="${p.species.name}" class="tpc-sprite"
+           onerror="this.replaceWith(makeTeamCardFallback(${p.speciesId}))">
+      <div class="tpc-name">${p.species.name}</div>
+      <div class="tpc-types">${typeDisplay}</div>
+    </div>
+  `;
+}
+
+function renderNegoCards() {
+  $('nego-cards').innerHTML = state.playerTeam.map((p, idx) => negoCardHtml(p, idx)).join('');
+  $('nego-swap-count').textContent = `交換のこり ${negoSwapsLeft}回`;
+  $('btn-nego-swap').disabled = negoSwapsLeft <= 0;
+}
+
+function runNegotiatePhase() {
+  return new Promise((resolve) => {
+    negoSwapsLeft = NEGO_SWAP_MAX;
+    negoArmedIdx = null;
+    renderNegoCards();
+    $('nego-hint').textContent = '';
+    $('negotiate-overlay').classList.add('show');
+
+    let finished = false;
+    const finishMine = async () => {
+      if (finished) return;
+      finished = true;
+      clearNegoTimer();
+      $('negotiate-overlay').classList.remove('show');
+      $('nego-wait-overlay').classList.add('show');
+      await Net.setNegoDone(true);
+
+      // 相手の完了を待つ
+      await new Promise((res) => {
+        Net.onOpponentNegoDone((done) => { if (done) res(); });
+      });
+      $('nego-wait-overlay').classList.remove('show');
+      await Net.clearNego();
+      resolve();
+    };
+
+    const onConfirmClick = () => {
+      $('btn-nego-confirm').removeEventListener('click', onConfirmClick);
+      $('btn-nego-reorder').removeEventListener('click', onReorderClick);
+      $('btn-nego-swap').removeEventListener('click', onSwapClick);
+      finishMine();
+    };
+    const onReorderClick = () => {
+      openNegoReorderOverlay();
+    };
+    const onSwapClick = () => {
+      if (negoSwapsLeft <= 0) return;
+      openNegoSwapOverlay(() => {
+        negoSwapsLeft -= 1;
+        renderNegoCards();
+        startNegoTimer(() => {
+          $('btn-nego-confirm').removeEventListener('click', onConfirmClick);
+          $('btn-nego-reorder').removeEventListener('click', onReorderClick);
+          $('btn-nego-swap').removeEventListener('click', onSwapClick);
+          finishMine();
+        });
+      });
+    };
+
+    $('btn-nego-confirm').addEventListener('click', onConfirmClick);
+    $('btn-nego-reorder').addEventListener('click', onReorderClick);
+    $('btn-nego-swap').addEventListener('click', onSwapClick);
+
+    startNegoTimer(() => {
+      $('btn-nego-confirm').removeEventListener('click', onConfirmClick);
+      $('btn-nego-reorder').removeEventListener('click', onReorderClick);
+      $('btn-nego-swap').removeEventListener('click', onSwapClick);
+      finishMine();
+    });
+  });
+}
+
+/* ---- 入れ替える ---- */
+function openNegoReorderOverlay() {
+  negoArmedIdx = null;
+  renderNegoReorderCards();
+  $('nego-reorder-overlay').classList.add('show');
+}
+
+function renderNegoReorderCards() {
+  const cardsHtml = state.playerTeam.map((poke, idx) => {
+    const armed = negoArmedIdx === idx;
+    const base = negoCardHtml(poke, idx);
+    return base.replace(
+      'class="trade-poke-card"',
+      `class="trade-poke-card ${armed ? 'swap-armed' : ''}"`
+    );
+  }).join('');
+  $('nego-reorder-cards').innerHTML = cardsHtml;
+}
+
+$('nego-reorder-cards').addEventListener('click', (e) => {
+  const infoBtn = e.target.closest('.tpc-info-btn');
+  if (infoBtn) {
+    const idx = parseInt(infoBtn.dataset.infoIdx, 10);
+    showTradeDetail(state.playerTeam[idx]);
+    return;
+  }
+  const card = e.target.closest('.trade-poke-card');
+  if (!card) return;
+  const idx = parseInt(card.dataset.idx, 10);
+  if (negoArmedIdx === null) {
+    negoArmedIdx = idx;
+  } else if (negoArmedIdx === idx) {
+    negoArmedIdx = null;
+  } else {
+    const tmp = state.playerTeam[negoArmedIdx];
+    state.playerTeam[negoArmedIdx] = state.playerTeam[idx];
+    state.playerTeam[idx] = tmp;
+    negoArmedIdx = null;
+  }
+  renderNegoReorderCards();
+});
+
+$('btn-nego-reorder-done').addEventListener('click', () => {
+  $('nego-reorder-overlay').classList.remove('show');
+  renderNegoCards();
+});
+
+/* ---- 手持ちを変える（ランダム3匹から1匹→手持ちの1匹と交換） ---- */
+let negoSwapPool = [];
+
+function openNegoSwapOverlay(onDone) {
+  const ids = [...getFinalSpeciesIds()].sort(() => Math.random() - 0.5).slice(0, 3);
+  negoSwapPool = ids.map((id) => createRandomPokemon(id, 100));
+  const offerRow = $('nego-swap-offer-row');
+  offerRow.innerHTML = negoSwapPool.map((p, idx) => tradeCardHtml(p, idx, false)).join('');
+  $('nego-swap-overlay').classList.add('show');
+
+  const onCancel = () => {
+    offerRow.removeEventListener('click', onOfferClick);
+    $('btn-nego-swap-cancel').removeEventListener('click', onCancel);
+    $('nego-swap-overlay').classList.remove('show');
+  };
+
+  const onOfferClick = async (e) => {
+    const infoBtn = e.target.closest('.tpc-info-btn');
+    if (infoBtn) {
+      const idx = parseInt(infoBtn.dataset.infoIdx, 10);
+      showTradeDetail(negoSwapPool[idx]);
+      return;
+    }
+    const card = e.target.closest('.trade-poke-card');
+    if (!card) return;
+    const offerIdx = parseInt(card.dataset.idx, 10);
+    const chosen = negoSwapPool[offerIdx];
+    const ok = await askConfirm(`${chosen.species.name}をもらいますか？`);
+    if (!ok) return;
+    offerRow.removeEventListener('click', onOfferClick);
+    $('btn-nego-swap-cancel').removeEventListener('click', onCancel);
+    $('nego-swap-overlay').classList.remove('show');
+    openNegoSwapReplaceOverlay(chosen, onDone);
+  };
+
+  offerRow.addEventListener('click', onOfferClick);
+  $('btn-nego-swap-cancel').addEventListener('click', onCancel);
+}
+
+function openNegoSwapReplaceOverlay(incoming, onDone) {
+  const replaceOverlay = $('nego-swap-replace-overlay');
+  const replaceRow = $('nego-swap-replace-row');
+  $('nego-swap-replace-title').textContent = `${incoming.species.name}と交換するポケモンをえらんでください`;
+  replaceRow.innerHTML = state.playerTeam.map((p, idx) => tradeCardHtml(p, idx, false)).join('');
+  replaceOverlay.classList.add('show');
+
+  const onReplaceClick = async (e) => {
+    const infoBtn = e.target.closest('.tpc-info-btn');
+    if (infoBtn) {
+      const idx = parseInt(infoBtn.dataset.infoIdx, 10);
+      showTradeDetail(state.playerTeam[idx]);
+      return;
+    }
+    const card = e.target.closest('.trade-poke-card');
+    if (!card) return;
+    const replaceIdx = parseInt(card.dataset.idx, 10);
+    const outgoing = state.playerTeam[replaceIdx];
+    const ok = await askConfirm(`${outgoing.species.name}と${incoming.species.name}を交換しますか？`);
+    if (!ok) return;
+    replaceRow.removeEventListener('click', onReplaceClick);
+    replaceOverlay.classList.remove('show');
+
+    const incomingCopy = Object.assign({}, incoming);
+    incomingCopy.moves = incoming.moves.map((m) => Object.assign({}, m));
+    resetPokeForBattle(incomingCopy);
+    state.playerTeam[replaceIdx] = incomingCopy;
+
+    onDone();
+  };
+  replaceRow.addEventListener('click', onReplaceClick);
 }
 
 async function onMultiplayerPickConfirm() {
-  if (pickedIds.length !== 3) return;
-  state.playerTeam = pickedIds.map((idx) => pickPool[idx]);
   state.playerTeam.forEach(resetPokeForBattle);
+
+  // ---- 選出後の交換フェーズ ----
+  await runNegotiatePhase();
+
   await Net.sendTeam(state.playerTeam);
 
   // バトル画面へ移動して待機
@@ -1569,18 +1851,14 @@ async function runMultiplayerBattleHost() {
   resetField();
   updateFieldDisplay();
 
-  state.mpHostEvents = [];
   queueMessage(`${state.cpuActive.species.name}が現れた！`);
   queueMessage(`ゆけっ！${state.playerActive.species.name}！`);
   await drainMessages();
-  await Net.pushEvents(state.mpHostEvents);
 
-  state.mpHostEvents = [];
   applyWeatherTerrainAbilityOnSwitchIn(state.cpuActive, makeLogFn(), state.playerActive);
   await drainMessages();
   applyWeatherTerrainAbilityOnSwitchIn(state.playerActive, makeLogFn(), state.cpuActive);
   await drainMessages();
-  await Net.pushEvents(state.mpHostEvents);
 
   await Net.pushEvent({ k: 'turn-end' });
 
@@ -1596,7 +1874,6 @@ async function runMultiplayerBattleHost() {
     });
     const guestAction = resolveRemoteAction(guestRaw, state.cpuActive);
 
-    state.mpHostEvents = [];
     msgQueue = [];
 
     if (myAction.type === 'switch') {
@@ -1618,7 +1895,6 @@ async function runMultiplayerBattleHost() {
 
     await postTurnCleanupMultiplayerHost();
 
-    await Net.pushEvents(state.mpHostEvents);
     await Net.pushEvent({ k: 'turn-end' });
   }
 }

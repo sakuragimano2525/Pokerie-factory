@@ -133,6 +133,27 @@ const Net = {
     this._unsubs.push(() => ref.off('value', handler));
   },
 
+  /* ---- 選出後の交換フェーズ（対人戦のみ） ---- */
+  async setNegoDone(done) {
+    if (!this.roomRef) return;
+    const path = this.isHost ? 'nego/hostDone' : 'nego/guestDone';
+    await this.roomRef.child(path).set(!!done);
+  },
+
+  onOpponentNegoDone(cb) {
+    if (!this.roomRef) return;
+    const path = this.isHost ? 'nego/guestDone' : 'nego/hostDone';
+    const ref = this.roomRef.child(path);
+    const handler = (snap) => cb(!!snap.val());
+    ref.on('value', handler);
+    this._unsubs.push(() => ref.off('value', handler));
+  },
+
+  async clearNego() {
+    if (!this.roomRef) return;
+    await this.roomRef.child('nego').remove();
+  },
+
   async sendAction(action) {
     if (!this.roomRef) return;
     const path = this.isHost ? 'battle/hostAction' : 'battle/guestAction';
@@ -196,6 +217,7 @@ const Net = {
           await this.roomRef.child('meta/status').set('waiting');
           await this.roomRef.child('guestTeam').remove();
           await this.roomRef.child('battle').remove();
+          await this.roomRef.child('nego').remove();
         }
       } catch (e) {}
     }

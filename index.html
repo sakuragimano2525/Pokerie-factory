@@ -858,6 +858,29 @@ html,body{
 .pick-count{ font-weight:800; font-size:12px; color:var(--ink-soft); margin: 0; }
 #btn-pick-confirm[disabled]{ opacity:0.4; cursor:not-allowed; }
 
+/* ---- 対人選出タイマー & 交換フェーズ ---- */
+.pick-timer-badge{
+  position:absolute; top:10px; right:14px;
+  width:40px; height:40px; border-radius:50%;
+  background: linear-gradient(135deg, var(--accent-a), var(--accent-b));
+  color:#fff; font-weight:900; font-size:16px;
+  display:flex; align-items:center; justify-content:center;
+  box-shadow: 1px 1px 4px rgba(0,0,0,0.25);
+  z-index:5;
+}
+.pick-timer-badge.warn{ background: linear-gradient(135deg, #e0596b, #c23a4d); animation: pickTimerPulse 0.6s infinite; }
+@keyframes pickTimerPulse{ 0%,100%{ transform:scale(1);} 50%{ transform:scale(1.12);} }
+.trade-card{ position:relative; }
+.negotiate-card{ width: min(94%, 640px); }
+.nego-swap-count{ font-weight:800; font-size:12px; color:var(--ink-soft); margin: 0 0 14px; }
+.nego-btn-row{ display:flex; gap:10px; justify-content:center; flex-wrap:wrap; }
+.nego-btn{ min-width:120px; }
+.nego-btn[disabled]{ opacity:0.4; cursor:not-allowed; }
+.nego-hint{ margin:12px 0 0; font-size:11px; color:var(--ink-soft); font-weight:700; min-height:14px; }
+#nego-cards .trade-poke-card,
+#nego-reorder-cards .trade-poke-card{ cursor:pointer; }
+#nego-reorder-cards .trade-poke-card.swap-armed{ border-color: var(--accent-b); }
+
 .team-title{ font-weight:900; font-size: clamp(14px,2vw,18px); color:var(--ink); margin:0; }
 .reorder-poke-card.swap-armed{ border-color: var(--accent-b); }
 .reorder-cards.reorder-mode .reorder-poke-card{ cursor:pointer; }
@@ -1122,10 +1145,65 @@ html,body{
   <!-- INITIAL PICK -->
   <div class="trade-overlay" id="pick-overlay">
     <div class="trade-card">
+      <div class="pick-timer-badge" id="pick-timer-badge" style="display:none;">
+        <span id="pick-timer-num">30</span>
+      </div>
       <p class="trade-title">6匹の中から3匹えらんでください（えらんだ順に手持ちへ並びます）</p>
       <div class="trade-offer-row" id="pick-row"></div>
       <p class="pick-count" id="pick-count">0 / 3 選択中</p>
       <button id="btn-pick-confirm" class="neu-btn primary start-btn" disabled>けってい</button>
+    </div>
+  </div>
+
+  <!-- ================= NEGOTIATE (対人戦：選出後の交換フェーズ) ================= -->
+  <div class="trade-overlay" id="negotiate-overlay">
+    <div class="trade-card negotiate-card">
+      <div class="pick-timer-badge" id="nego-timer-badge">
+        <span id="nego-timer-num">30</span>
+      </div>
+      <p class="trade-title">手持ちを確認してください</p>
+      <div class="trade-offer-row" id="nego-cards"></div>
+      <p class="nego-swap-count" id="nego-swap-count">交換のこり 5回</p>
+      <div class="nego-btn-row">
+        <button id="btn-nego-confirm" class="neu-btn primary nego-btn" type="button">けってい</button>
+        <button id="btn-nego-reorder" class="neu-btn nego-btn" type="button">入れ替える</button>
+        <button id="btn-nego-swap" class="neu-btn nego-btn" type="button">手持ちを変える</button>
+      </div>
+      <p class="nego-hint" id="nego-hint"></p>
+    </div>
+  </div>
+
+  <!-- NEGOTIATE: reorder mode overlay (入れ替え中) -->
+  <div class="trade-overlay" id="nego-reorder-overlay">
+    <div class="trade-card negotiate-card">
+      <p class="trade-title">入れ替えたい2匹をタップしてください</p>
+      <div class="trade-offer-row" id="nego-reorder-cards"></div>
+      <button id="btn-nego-reorder-done" class="neu-btn primary start-btn" type="button">もどる</button>
+    </div>
+  </div>
+
+  <!-- NEGOTIATE: swap offer (ランダム3匹から選ぶ) -->
+  <div class="trade-overlay" id="nego-swap-overlay">
+    <div class="trade-card">
+      <p class="trade-title">このポケモンの中から選んでください</p>
+      <div class="trade-offer-row" id="nego-swap-offer-row"></div>
+      <button id="btn-nego-swap-cancel" class="neu-btn" type="button">やめる</button>
+    </div>
+  </div>
+
+  <!-- NEGOTIATE: swap replace (だれと交換するか) -->
+  <div class="trade-overlay" id="nego-swap-replace-overlay">
+    <div class="trade-card">
+      <p class="trade-title" id="nego-swap-replace-title">だれと交換しますか？</p>
+      <div class="trade-offer-row" id="nego-swap-replace-row"></div>
+    </div>
+  </div>
+
+  <!-- NEGOTIATE: waiting for opponent -->
+  <div class="trade-overlay" id="nego-wait-overlay">
+    <div class="trade-card">
+      <p class="trade-title">相手の準備を待っています…</p>
+      <div class="host-wait-spinner"></div>
     </div>
   </div>
 

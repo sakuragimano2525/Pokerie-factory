@@ -175,8 +175,10 @@ function createRandomPokemon(speciesId, level = 100) {
       damageFormula: null, callRandomMove: false, locked: false });
   }
 
+  const shiny = rand(1, 100) <= 5; // 5%の確率で色違い
+
   return {
-    speciesId, species, level, nature, ability,
+    speciesId, species, level, nature, ability, shiny,
     evs, iv, stats, maxHp: stats.hp, currentHp: stats.hp,
     moves,
     status: STATUS.NONE, badlyPoisonCounter: 0, confuseTurns: 0,
@@ -363,6 +365,9 @@ const ABILITY = {
   MAGIC_MIRROR: 125,
   SURINUKE: 123,
   KIKENYOCHI_2: 122,
+  KAGEFUMI: 121,
+  NERVOUS_RAGE: 124,
+  HAKKOU: 85,
 };
 
 const KIKENYOCHI_ABILITIES = [ABILITY.KIKIKAIHI, ABILITY.KIKENYOCHI_2];
@@ -474,12 +479,29 @@ function applyRankChange(target, rankData, logFn, attackerAbility) {
   if (rand(1, 100) > chance) return;
   const keys = ['atk', 'def', 'spa', 'spd', 'spe', 'acc', 'eva'];
   let changed = false;
+  const statName = { atk: 'こうげき', def: 'ぼうぎょ', spa: 'とくこう', spd: 'とくぼう', spe: 'すばやさ', acc: 'めいちゅう', eva: 'かいひ' };
+  // 同じ変化幅（changePhrase）ごとにステータス名をまとめて、まとめてログ出力するためのバッファ。
+  // 例：「こうげきとすばやさと命中率が上がった！」「ぼうぎょととくぼうが下がった！」
+  const groups = new Map(); // changePhrase -> [statName, ...]
+  const pushGroup = (phrase, name) => {
+    if (!groups.has(phrase)) groups.set(phrase, []);
+    groups.get(phrase).push(name);
+  };
+  const flushGroups = () => {
+    groups.forEach((names, phrase) => {
+      logFn(`${target.species.name}の${formatStatNameList(names)}が\n${phrase}`);
+    });
+    groups.clear();
+  };
+
   keys.forEach((k, idx) => {
     let delta = rankData[idx + 1];
     if (!delta) return;
 
     if (battleField.chemicalGasActive && target.ability !== ABILITY.KAGAKUHENKAGASU) return;
     if (target.ability === ABILITY.CLEAR_BODY && delta < 0) return;
+    // はっこう：自分の命中率ランクが下がらない
+    if (target.ability === ABILITY.HAKKOU && k === 'acc' && delta < 0) return;
     if (target.ability === ABILITY.TANJUN) delta *= 2;
     if (target.ability === ABILITY.AMANOJAKU) delta = -delta;
 
@@ -488,7 +510,6 @@ function applyRankChange(target, rankData, logFn, attackerAbility) {
     if (target.ranks[k] !== before) {
       changed = true;
       const actualDelta = target.ranks[k] - before;
-      const statName = { atk: 'こうげき', def: 'ぼうぎょ', spa: 'とくこう', spd: 'とくぼう', spe: 'すばやさ', acc: 'めいちゅう', eva: 'かいひ' }[k];
       let changePhrase;
       if (actualDelta >= 3) changePhrase = 'ぐぐーんと上がった！';
       else if (actualDelta === 2) changePhrase = 'ぐーんと上がった！';
@@ -496,9 +517,10 @@ function applyRankChange(target, rankData, logFn, attackerAbility) {
       else if (actualDelta === -1) changePhrase = '下がった！';
       else if (actualDelta === -2) changePhrase = 'ガクッと下がった！';
       else changePhrase = 'ガクッと下がった！';
-      logFn(`${target.species.name}の${statName}が${changePhrase}`);
+      pushGroup(changePhrase, statName[k]);
 
       if (delta > 0 && target.ability === ABILITY.BINJOU && attackerAbility !== target.ability) {
+        flushGroups();
         const traceDelta = [100, delta, delta, delta, delta, delta, delta, delta];
         applyRankChange(target, traceDelta, logFn, target.ability);
         logFn(`${target.species.name}のびんじょうが発動！`);
@@ -506,16 +528,19 @@ function applyRankChange(target, rankData, logFn, attackerAbility) {
 
       if (delta < 0) {
         if (k === 'atk' && target.ability === ABILITY.MAKENKI) {
+          flushGroups();
           const boostData = [100, 2, 0, 0, 0, 0, 0, 0];
           applyRankChange(target, boostData, logFn);
           logFn(`${target.species.name}のまけんきが発動！`);
         }
         if (k === 'spa' && target.ability === ABILITY.KACHIKI) {
+          flushGroups();
           const boostData = [100, 0, 0, 2, 0, 0, 0, 0];
           applyRankChange(target, boostData, logFn);
           logFn(`${target.species.name}のかちきが発動！`);
         }
         if (k === 'atk' && target.ability === ABILITY.TOUSOUSHIN) {
+          flushGroups();
           const boostData = [100, 2, 0, 0, 0, 0, 0, 0];
           applyRankChange(target, boostData, logFn);
           logFn(`${target.species.name}のとうそうしんが発動！`);
@@ -523,7 +548,13 @@ function applyRankChange(target, rankData, logFn, attackerAbility) {
       }
     }
   });
+  flushGroups();
   return changed;
+}
+
+// ステータス名の配列を「AとBとC」の形式に整形する（1つなら単体、複数なら「と」で連結）。
+function formatStatNameList(names) {
+  return names.join('と');
 }
 
 function applyStatus(target, statusData, logFn, attackerAbility) {
@@ -765,6 +796,11 @@ function calcDamage(attacker, defender, move, logFn) {
     if (!battleField.chemicalGasActive || defender.ability === ABILITY.KAGAKUHENKAGASU) effDef *= 1.5;
   }
   if (attacker.ability === ABILITY.HARIKIRI && isPhysical) {
+    if (!battleField.chemicalGasActive || attacker.ability === ABILITY.KAGAKUHENKAGASU) effAtk *= 1.5;
+  }
+  // ナーバスレイジ：自分がアンコール・ちょうはつ状態の時、攻撃技（物理・特殊）の威力が1.5倍
+  if (attacker.ability === ABILITY.NERVOUS_RAGE && move.category !== 'status'
+      && ((attacker.encoreTurns || 0) > 0 || (attacker.tauntTurns || 0) > 0)) {
     if (!battleField.chemicalGasActive || attacker.ability === ABILITY.KAGAKUHENKAGASU) effAtk *= 1.5;
   }
 
@@ -1312,8 +1348,6 @@ function executeMultiHit(attacker, defender, move, logFn) {
       if (move.flinchChance && rand(1, 100) <= move.flinchChance) {
         defender.flinch = true;
       }
-      applyRankChange(defender, move.oppRank, logFn);
-      applyRankChange(attacker, move.selfRank, logFn);
       applyStatus(defender, move.oppStatus, logFn, attacker.ability);
     }
 
@@ -1339,6 +1373,15 @@ function executeMultiHit(attacker, defender, move, logFn) {
       break;
     }
     anyHit = true;
+  }
+
+  // ランク変化（selfRank/oppRank）は連続ヒットの回数分ではなく、技を出した時に1回だけ適用する。
+  if (anyHit && !attacker.fainted) {
+    const suppressSecondary = attacker.ability === ABILITY.CHIKARAZUKU;
+    if (!suppressSecondary) {
+      applyRankChange(defender, move.oppRank, logFn);
+      applyRankChange(attacker, move.selfRank, logFn);
+    }
   }
 
   return true;
@@ -1424,6 +1467,11 @@ function executeMove(attacker, defender, move, logFn) {
     logFn(`${attacker.species.name}の${typeJp(move.type)}タイプの技はロックされていて出せない！`);
     return;
   }
+
+  // 挑発・タイプロック等でブロックされず、実際に技を使うことが確定した時点で記録する
+  // （アンコール・ひややかパンチ用）。個別分岐でreturnする変化技（リフレクター等）も含めて
+  // ここで一元的に記録し、途中の各処理で上書きされても同じ値が入るだけなので問題ない。
+  attacker.lastUsedMoveId = move.id;
 
   // ---- のろわれボディ ----
   if (defender.ability === ABILITY.NOROWARE_BODY && move.category === 'physical' && !defender.fainted) {
@@ -1593,11 +1641,11 @@ function executeMove(attacker, defender, move, logFn) {
   }
 
   // ---- ひややかパンチ (226) ----
-  if (move.id === 226 && attacker.side === 'player' && defender.side === 'cpu') {
+  if (move.id === 226) {
     if (defender.lastUsedMoveId !== null) {
       const targetMove = defender.moves.find(m => m.id === defender.lastUsedMoveId);
       if (targetMove && targetMove.pp > 0) {
-        const reduce = Math.min(3, targetMove.pp);
+        const reduce = Math.min(4, targetMove.pp);
         targetMove.pp -= reduce;
         logFn(`${defender.species.name}の${targetMove.name}のPPが${reduce}減った！`);
       } else {
@@ -1716,8 +1764,8 @@ function executeMove(attacker, defender, move, logFn) {
       checkAndTriggerFundo(defender, logFn);
       applyDamageTakenEffects(attacker, logFn);
       applyDamageTakenEffects(defender, logFn);
-      // 攻撃後、相手のlastUsedMoveIdを記録
-      defender.lastUsedMoveId = move.id;
+      // 技を使った本人（attacker）のlastUsedMoveIdを記録（アンコール・ひややかパンチ用）
+      attacker.lastUsedMoveId = move.id;
       return;
     }
   }
@@ -1834,6 +1882,8 @@ function executeMove(attacker, defender, move, logFn) {
     if (!suppressSecondary) applyRankChange(defender, move.oppRank, logFn);
     if (!suppressSecondary) applyStatus(attacker, move.selfStatus, logFn);
     if (!suppressSecondary) applyStatus(defender, move.oppStatus, logFn, attacker.ability);
+    // 技を使った本人（attacker）のlastUsedMoveIdを記録（アンコール・ひややかパンチ用）
+    attacker.lastUsedMoveId = move.id;
     return;
   }
 
@@ -2032,8 +2082,8 @@ function executeMove(attacker, defender, move, logFn) {
   applyDamageTakenEffects(attacker, logFn);
   applyDamageTakenEffects(defender, logFn);
 
-  // 相手のlastUsedMoveIdを記録（アンコール用）
-  defender.lastUsedMoveId = move.id;
+  // 技を使った本人（attacker）のlastUsedMoveIdを記録（アンコール・ひややかパンチ用）
+  attacker.lastUsedMoveId = move.id;
 
   if ((move.id === 3 || move.id === 349 || move.id === 80) && !attacker.fainted) {
     attacker.pendingSwitchOut = true;
@@ -2093,6 +2143,11 @@ async function runTurn(playerAction, cpuAction, playerPoke, cpuPoke, logFn, onIm
       }
     }
   }
+
+  // このターンの行動機会は既に終了しているため、これ以上消費されずに残ったひるみフラグは
+  // 次ターンへ持ち越さずここで破棄する（「先攻に当てたひるみが次のターンに発動する」誤動作を防止）。
+  if (!playerPoke.fainted) playerPoke.flinch = false;
+  if (!cpuPoke.fainted) cpuPoke.flinch = false;
 
   [playerPoke, cpuPoke].forEach((p) => { if (!p.fainted) applyEndOfTurnStatus(p, logFn); });
   const alivePokes = [playerPoke, cpuPoke].filter((p) => !p.fainted);

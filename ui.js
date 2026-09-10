@@ -33,17 +33,170 @@ const state = {
   mpHostEvents: [],
 };
 
-// ---- UIクリック効果音 ----
-const clickSound = new Audio('./click.mp3');
-clickSound.volume = 0.5;
-document.addEventListener('click', (e) => {
-  if (e.target.closest('button')) {
-    try {
-      clickSound.currentTime = 0;
-      clickSound.play().catch(() => {});
-    } catch (err) {}
+/* =========================================================
+   アセットプリロード（画像・効果音・BGM）
+   ========================================================= */
+const AssetPreloader = (() => {
+  const imageCache = new Map(); // key: path, value: HTMLImageElement
+  const audioBuffers = new Map(); // key: path, value: HTMLAudioElement (decoded/ready)
+
+  function preloadImage(path) {
+    if (imageCache.has(path)) return imageCache.get(path);
+    const img = new Image();
+    img.src = path;
+    imageCache.set(path, img);
+    return img;
   }
-}, true);
+
+  function preloadAudio(path) {
+    if (audioBuffers.has(path)) return audioBuffers.get(path);
+    const a = new Audio();
+    a.preload = 'auto';
+    a.src = path;
+    try { a.load(); } catch (e) {}
+    audioBuffers.set(path, a);
+    return a;
+  }
+
+  // 全ポケモン種族の通常/色違い画像を事前ロード
+  function preloadAllSpeciesSprites() {
+    try {
+      const ids = Object.keys(GAME_DATA.species || {});
+      ids.forEach((id) => {
+        preloadImage(`./${id}.png`);
+        preloadImage(`./${id}s.png`);
+      });
+    } catch (e) {}
+  }
+
+  // タイプアイコン画像の事前ロード
+  function preloadTypeIcons() {
+    for (let i = 1; i <= 20; i++) preloadImage(`./type${i}.png`);
+  }
+
+  // BGM候補の事前ロード（click.mp3は専用プールで別途プリロード済み）
+  function preloadAudioAssets() {
+    preloadAudio('./menu.mp3');
+    for (let i = 1; i <= 20; i++) preloadAudio(`./${i}.mp3`);
+  }
+
+  function preloadAll() {
+    preloadTypeIcons();
+    preloadAudioAssets();
+    // 種族画像は数が多いので、他の初期化を邪魔しないよう少し遅延して開始
+    setTimeout(() => preloadAllSpeciesSprites(), 0);
+  }
+
+  return { preloadImage, preloadAudio, preloadAll, audioBuffers };
+})();
+
+/* ---------------- UIクリック効果音 ---------------- */
+// 連打しても遅延なく鳴らせるよう、複数のAudioインスタンスをプールして使い回す
+const CLICK_SOUND_POOL_SIZE = 6;
+const clickSoundPool = [];
+let clickSoundIdx = 0;
+function initClickSoundPool() {
+  for (let i = 0; i < CLICK_SOUND_POOL_SIZE; i++) {
+    const a = new Audio('./click.mp3');
+    a.preload = 'auto';
+    a.volume = 0.5;
+    try { a.load(); } catch (e) {}
+    clickSoundPool.push(a);
+  }
+}
+initClickSoundPool();
+
+function playClickSound() {
+  const a = clickSoundPool[clickSoundIdx];
+  clickSoundIdx = (clickSoundIdx + 1) % clickSoundPool.length;
+  try {
+    a.currentTime = 0;
+    const p = a.play();
+    if (p && p.catch) p.catch(() => {});
+  } catch (err) {}
+}
+
+// クリックが成立した瞬間（＝ボタンをちゃんと押して離した時）だけ鳴らす。
+// pointerdown/touchstartだと触れただけで発火してしまうため使わない。
+// Audioはプリロード済みのプールから取るので、click発火から再生開始までの遅延はほぼない。
+function handleClickSoundTrigger(e) {
+  if (!e.target.closest('button')) return;
+  playClickSound();
+}
+document.addEventListener('click', handleClickSoundTrigger, true);
+
+/* ---------------- バトルBGM ---------------- */
+const BattleBgm = (() => {
+  let currentAudio = null;
+
+  function pickTrackPath() {
+    const n = rand(1, 20);
+    return `./${n}.mp3`;
+  }
+
+  function start() {
+    MenuBgm.stop();
+    stop();
+    const path = pickTrackPath();
+    const preloaded = AssetPreloader.audioBuffers.get(path);
+    const audio = preloaded ? preloaded : new Audio(path);
+    audio.loop = true;
+    audio.volume = 0.4;
+    try { audio.currentTime = 0; } catch (e) {}
+    currentAudio = audio;
+    const p = audio.play();
+    if (p && p.catch) p.catch(() => {});
+  }
+
+  function stop() {
+    if (currentAudio) {
+      try {
+        currentAudio.pause();
+        currentAudio.currentTime = 0;
+      } catch (e) {}
+      currentAudio = null;
+    }
+  }
+
+  return { start, stop };
+})();
+
+/* ---------------- ホーム/選出/ルーム待機中のBGM ---------------- */
+// バトル本編（トレーナー戦・対人戦）に入っている間以外、基本的にこれを鳴らし続ける。
+// すでに再生中なら再度呼ばれても再生し直さない（画面遷移のたびに音が途切れないように）。
+const MenuBgm = (() => {
+  let audio = null;
+  let playing = false;
+
+  function getAudio() {
+    if (audio) return audio;
+    const preloaded = AssetPreloader.audioBuffers.get('./menu.mp3');
+    audio = preloaded ? preloaded : new Audio('./menu.mp3');
+    audio.loop = true;
+    audio.volume = 0.4;
+    return audio;
+  }
+
+  function start() {
+    if (playing) return;
+    playing = true;
+    const a = getAudio();
+    const p = a.play();
+    if (p && p.catch) p.catch(() => {});
+  }
+
+  function stop() {
+    playing = false;
+    if (audio) {
+      try {
+        audio.pause();
+        audio.currentTime = 0;
+      } catch (e) {}
+    }
+  }
+
+  return { start, stop };
+})();
 
 function $(id) { return document.getElementById(id); }
 
@@ -91,8 +244,14 @@ function showScreen(name) {
 }
 
 /* ---------------- Sprite helpers ---------------- */
-function spriteImgTag(speciesId, cls) {
-  return `<img src="./${speciesId}.png" class="${cls}" onerror="this.replaceWith(makeFallback(${speciesId}, this.className))">`;
+// 色違いなら "3s.png" のように末尾にsを付けたファイル名を返す
+function spritePath(poke) {
+  if (!poke) return '';
+  return `./${poke.speciesId}${poke.shiny ? 's' : ''}.png`;
+}
+function spriteImgTag(poke, cls) {
+  const speciesId = poke.speciesId;
+  return `<img src="${spritePath(poke)}" class="${cls}" onerror="this.replaceWith(makeFallback(${speciesId}, this.className))">`;
 }
 function fallbackColor(speciesId) {
   const hue = (speciesId * 47) % 360;
@@ -115,7 +274,7 @@ function renderTeamCard(poke, idx) {
   return `
     <div class="trade-poke-card" data-idx="${idx}">
       <button class="tpc-info-btn" data-info-idx="${idx}" type="button"><span>!</span></button>
-      <img src="./${poke.speciesId}.png" alt="${poke.species.name}" class="tpc-sprite"
+      <img src="${spritePath(poke)}" alt="${poke.species.name}" class="tpc-sprite"
            onerror="this.replaceWith(makeTeamCardFallback(${poke.speciesId}))">
       <div class="tpc-name">${poke.species.name}</div>
       <div class="tpc-types">
@@ -224,7 +383,7 @@ function updateHud(poke, prefix, hpOverride) {
 function setSprite(poke, side) {
   const wrap = $(side === 'opp' ? 'sprite-opp-wrap' : 'sprite-self-wrap');
   const cls = side === 'opp' ? 'sprite sprite-opp enter-opp' : 'sprite sprite-self enter-self';
-  wrap.innerHTML = spriteImgTag(poke.speciesId, cls);
+  wrap.innerHTML = spriteImgTag(poke, cls);
   if (state.multiplayer && state.isHost) {
     const hostSide = side === 'opp' ? 'cpu' : 'player';
     const team = hostSide === 'player' ? state.playerTeam : state.cpuTeam;
@@ -273,8 +432,21 @@ function renderActionMenu() {
       drainMessages().then(() => {});
       return;
     }
+    if (isTrappedByKagefumi(state.playerActive, state.cpuActive)) {
+      queueMessage(`${state.cpuActive.species.name}のかげふみで交代できない！`);
+      drainMessages().then(() => {});
+      return;
+    }
     renderSwitchMenu();
   });
+}
+
+// かげふみ：対人戦のみ、相手が交代できなくなる（とんぼがえり等の強制交代・瀕死時は対象外）
+function isTrappedByKagefumi(self, opponent) {
+  if (!state.multiplayer) return false;
+  if (!opponent || opponent.fainted) return false;
+  if (!self || self.fainted) return false;
+  return opponent.ability === 121; // かげふみ
 }
 
 function renderMoveMenu() {
@@ -386,7 +558,7 @@ function watchSideItemHtml(poke, side, isSelected) {
   const label = side === 'self' ? 'じぶん' : 'あいて';
   const ratio = poke ? Math.max(0, poke.currentHp / poke.maxHp) : 0;
   const iconHtml = poke
-    ? `<img src="./${poke.speciesId}.png" alt="" class="wsi-icon" onerror="this.replaceWith(makeTeamCardFallback(${poke.speciesId}))">`
+    ? `<img src="${spritePath(poke)}" alt="" class="wsi-icon" onerror="this.replaceWith(makeTeamCardFallback(${poke.speciesId}))">`
     : `<div class="wsi-icon">-</div>`;
   const typeLabel = poke ? getEffectiveTypesForDisplay(poke).map(t => typeJp(t)).join('/') : '-';
   return `
@@ -618,6 +790,9 @@ const ABILITY_DESC_BY_ID = {
 122: '相手の危険な技を2つログ表示（111と同じ）',
 123: '相手の壁（リフレクター・ひかりのかべ）を貫通する',
 125: '変化技を跳ね返す',
+85: '自分の命中率ランクが下がらない',
+121: '（対人戦）相手を交代できなくする',
+124: '自分がアンコール・ちょうはつ中、攻撃技の威力が1.5倍になる',
   41: 'ピンチに くさのいりょくが あがる',
   42: 'ピンチに ほのおのいりょくが あがる',
   43: 'ピンチに みずのいりょくが あがる',
@@ -710,7 +885,7 @@ function partyListItemHtml(p, idx) {
   }
   return `
     <button class="party-list-item ${isActive ? 'active' : ''} ${p.fainted ? 'fainted' : ''}" data-idx="${idx}" ${p.fainted ? 'disabled' : ''}>
-      <img src="./${p.speciesId}.png" alt="" class="pli-icon" onerror="this.replaceWith(makeTeamCardFallback(${p.speciesId}))">
+      <img src="${spritePath(p)}" alt="" class="pli-icon" onerror="this.replaceWith(makeTeamCardFallback(${p.speciesId}))">
       <div class="pli-info">
         <div class="pli-name">${p.species.name} <span style="font-size:10px;color:var(--accent-b);">${typeChangeText}</span></div>
         <div class="pli-hpbar-outer"><div class="pli-hpbar-inner" style="width:${ratio * 100}%; background:${hpBarColor(ratio)};"></div></div>
@@ -1037,6 +1212,7 @@ async function resolveImmediateSwitch(side) {
 
 async function runBattleLoop() {
   state.battleBusy = true;
+  BattleBgm.start();
   state.playerActive.side = 'player';
   state.cpuActive.side = 'cpu';
   updateHud(state.playerActive, 'self');
@@ -1123,6 +1299,7 @@ function waitForForcedSwitch() {
 
 async function endBattle(playerWon) {
   state.battleBusy = false;
+  BattleBgm.stop();
   if (playerWon) state.winStreak++;
   const overlay = $('result-overlay');
   $('result-title').textContent = playerWon ? 'WIN' : 'LOSE';
@@ -1135,10 +1312,12 @@ async function endBattle(playerWon) {
   $('btn-result-next').onclick = async () => {
     overlay.classList.remove('show');
     if (playerWon) {
+      MenuBgm.start();
       await runTradeSequence();
       renderReorderScreen();
     } else {
       state.winStreak = 0;
+      MenuBgm.start();
       showScreen('title');
     }
   };
@@ -1153,7 +1332,7 @@ function tradeCardHtml(p, idx, disabled) {
   return `
     <div class="trade-poke-card ${disabled ? 'disabled' : ''}" data-idx="${idx}">
       <button class="tpc-info-btn" data-info-idx="${idx}" type="button"><span>!</span></button>
-      <img src="./${p.speciesId}.png" alt="${p.species.name}" class="tpc-sprite"
+      <img src="${spritePath(p)}" alt="${p.species.name}" class="tpc-sprite"
            onerror="this.replaceWith(makeTeamCardFallback(${p.speciesId}))">
       <div class="tpc-name">${p.species.name}</div>
       <div class="tpc-types">
@@ -1313,7 +1492,7 @@ function pickCardHtml(poke, idx) {
     <div class="trade-poke-card ${orderPos >= 0 ? 'selected' : ''}" data-idx="${idx}">
       <button class="tpc-info-btn" data-info-idx="${idx}" type="button"><span>!</span></button>
       ${orderPos >= 0 ? `<span class="pick-order-badge">${orderLabel}</span>` : ''}
-      <img src="./${poke.speciesId}.png" alt="${poke.species.name}" class="tpc-sprite"
+      <img src="${spritePath(poke)}" alt="${poke.species.name}" class="tpc-sprite"
            onerror="this.replaceWith(makeTeamCardFallback(${poke.speciesId}))">
       <div class="tpc-name">${poke.species.name}</div>
       <div class="tpc-types">
@@ -1386,6 +1565,7 @@ let reorderMode = false;
 let reorderArmedIdx = null;
 
 function renderReorderScreen() {
+  MenuBgm.start();
   reorderMode = false;
   reorderArmedIdx = null;
   $('btn-reorder-toggle').textContent = '並び替えをする';
@@ -1439,6 +1619,7 @@ $('team-cards').addEventListener('click', (e) => {
 });
 
 function startNewRun() {
+  MenuBgm.start();
   state.multiplayer = false;
   state.winStreak = 0;
   showInitialPickOverlay();
@@ -1453,6 +1634,7 @@ function generateRoomId() {
 }
 
 function showMultiplayerMenu() {
+  MenuBgm.start();
   showScreen('multiplayer');
 }
 
@@ -1518,6 +1700,7 @@ async function startHostRoom() {
   $('host-wait-hint').textContent = '友達にこの4ケタの番号を伝えてください';
   $('host-wait-cancel').textContent = 'キャンセル';
   showScreen('host-waiting');
+  MenuBgm.start();
 
   Net.onGuestJoined((guestName) => {
     state.opponentName = guestName;
@@ -1539,6 +1722,7 @@ async function joinRoom(code) {
   $('host-wait-hint').textContent = `ホスト（${Net.opponentName} さん）の準備を待っています…`;
   $('host-wait-cancel').textContent = 'もどる';
   showScreen('host-waiting');
+  MenuBgm.start();
 
   Net.onStatusChange((status) => {
     if (status === 'both-in') { startMultiplayerPick(); }
@@ -1554,6 +1738,7 @@ function cancelHostRoom() {
 
 /* ---- 選出 ---- */
 function startMultiplayerPick() {
+  MenuBgm.start();
   state.multiplayer = true;
   state.winStreak = 0;
   state.opponentName = Net.opponentName || '';
@@ -1605,7 +1790,7 @@ function negoCardHtml(p, idx) {
   return `
     <div class="trade-poke-card" data-idx="${idx}">
       <button class="tpc-info-btn" data-info-idx="${idx}" type="button"><span>!</span></button>
-      <img src="./${p.speciesId}.png" alt="${p.species.name}" class="tpc-sprite"
+      <img src="${spritePath(p)}" alt="${p.species.name}" class="tpc-sprite"
            onerror="this.replaceWith(makeTeamCardFallback(${p.speciesId}))">
       <div class="tpc-name">${p.species.name}</div>
       <div class="tpc-types">${typeDisplay}</div>
@@ -1832,6 +2017,8 @@ async function onMultiplayerPickConfirm() {
     $('battle-log-stack').innerHTML = '';
     logLines = [];
 
+    BattleBgm.start();
+
     if (state.isHost) {
       await runMultiplayerBattleHost();
     } else {
@@ -1973,6 +2160,7 @@ async function postTurnCleanupMultiplayerHost() {
 
 async function endMultiplayerBattleHost(hostWon) {
   state.battleBusy = false;
+  BattleBgm.stop();
   const overlay = $('result-overlay');
   $('result-title').textContent = hostWon ? 'WIN' : 'LOSE';
   $('result-title').className = 'result-title ' + (hostWon ? 'win' : 'lose');
@@ -1983,6 +2171,7 @@ async function endMultiplayerBattleHost(hostWon) {
     overlay.classList.remove('show');
     await Net.leave();
     state.multiplayer = false;
+    MenuBgm.start();
     showScreen('title');
   };
 }
@@ -2070,6 +2259,7 @@ async function handleGuestEvent(ev) {
 
   if (ev.k === 'end') {
     state.battleBusy = false;
+    BattleBgm.stop();
     const guestWon = !ev.win;
     const overlay = $('result-overlay');
     $('result-title').textContent = guestWon ? 'WIN' : 'LOSE';
@@ -2080,6 +2270,7 @@ async function handleGuestEvent(ev) {
       overlay.classList.remove('show');
       await Net.leave();
       state.multiplayer = false;
+      MenuBgm.start();
       showScreen('title');
     };
     return;
@@ -2182,3 +2373,15 @@ $('screen-title').addEventListener('click', (e) => {
 
 checkOrientation();
 showScreen('title');
+
+// アセット（画像・効果音・BGM）を事前読み込みしておく
+AssetPreloader.preloadAll();
+
+// ブラウザの自動再生制限のため、最初のユーザー操作でホームBGMを開始する
+function startMenuBgmOnFirstInteraction() {
+  MenuBgm.start();
+  document.removeEventListener('pointerdown', startMenuBgmOnFirstInteraction, true);
+  document.removeEventListener('click', startMenuBgmOnFirstInteraction, true);
+}
+document.addEventListener('pointerdown', startMenuBgmOnFirstInteraction, true);
+document.addEventListener('click', startMenuBgmOnFirstInteraction, true);

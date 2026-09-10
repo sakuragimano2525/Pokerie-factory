@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>ポケドロック バトルファクトリー</title>
+<title>ポケリエ バトルファクトリー</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700;800;900&family=Zen+Maru+Gothic:wght@500;700;900&display=swap');
 
@@ -527,6 +527,7 @@ html,body{
   box-shadow: 0 4px 12px rgba(0,0,0,0.18);
   opacity:0; transform: translateY(-6px);
   animation: logLineIn .16s ease forwards;
+  white-space: pre-line;
 }
 @keyframes logLineIn{ from{ opacity:0; transform:translateY(-6px);} to{ opacity:1; transform:translateY(0);} }
 .battle-log-line.leaving{ animation: logLineOut .14s ease forwards; }
@@ -1085,9 +1086,9 @@ html,body{
   <!-- ================= TITLE ================= -->
   <div id="screen-title" class="screen">
     <div class="title-card">
-      <p class="title-logo">POKÉDROCK</p>
+      <p class="title-logo">ポケリエ バトルファクトリー</p>
       <p class="title-logo" style="font-size:0.55em; margin-top:-14px;">BATTLE FACTORY</p>
-      <p class="title-sub">ランダム3匹で挑む　連戦バトル</p>
+      <p class="title-sub">MPLだけの オリジナル対戦ゲーム</p>
       <div class="title-menu-row">
         <button id="btn-npc-battle" class="neu-btn primary title-menu-btn" type="button">
           <span class="tmb-title">NPCとバトル</span>

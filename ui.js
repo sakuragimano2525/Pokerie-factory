@@ -31,6 +31,7 @@ const state = {
   isHost: false,
   multiplayer: false,
   mpHostEvents: [],
+  turnNumber: 1,
 };
 
 /* =========================================================
@@ -124,6 +125,46 @@ function handleClickSoundTrigger(e) {
   playClickSound();
 }
 document.addEventListener('click', handleClickSoundTrigger, true);
+
+/* ---------------- バトル効果音（タイプ相性／ランク変化） ---------------- */
+// click.mp3と同じ「プール方式」で、連続再生してもラグなく鳴らせるようにする。
+const BATTLE_SFX_POOL_SIZE = 4;
+const battleSfxPools = {};
+function getBattleSfxPool(path) {
+  if (!battleSfxPools[path]) {
+    const pool = [];
+    for (let i = 0; i < BATTLE_SFX_POOL_SIZE; i++) {
+      const a = new Audio(path);
+      a.preload = 'auto';
+      a.volume = 0.6;
+      try { a.load(); } catch (e) {}
+      pool.push(a);
+    }
+    battleSfxPools[path] = { pool, idx: 0 };
+  }
+  return battleSfxPools[path];
+}
+function playBattleSfx(path) {
+  const entry = getBattleSfxPool(path);
+  const a = entry.pool[entry.idx];
+  entry.idx = (entry.idx + 1) % entry.pool.length;
+  try {
+    a.currentTime = 0;
+    const p = a.play();
+    if (p && p.catch) p.catch(() => {});
+  } catch (err) {}
+}
+// タイプ相性倍率に応じた効果音（等倍=hit、効果抜群系=supeff、効果今ひとつ系=noteff。4倍・4分の1も同じ扱い）
+function playTypeEffectSound(typeMult) {
+  if (typeMult > 1) playBattleSfx('./supeff.mp3');
+  else if (typeMult > 0 && typeMult < 1) playBattleSfx('./noteff.mp3');
+  else if (typeMult === 1) playBattleSfx('./hit.mp3');
+  // typeMult === 0（無効）の場合は音を鳴らさない
+}
+function playRankUpSound() { playBattleSfx('./sup.mp3'); }
+function playRankDownSound() { playBattleSfx('./fall.mp3'); }
+// click.mp3同様、あらかじめプールを生成しておき初回再生の遅延を防ぐ
+['./supeff.mp3', './noteff.mp3', './hit.mp3', './sup.mp3', './fall.mp3'].forEach(getBattleSfxPool);
 
 /* ---------------- バトルBGM ---------------- */
 const BattleBgm = (() => {
@@ -295,8 +336,16 @@ window.makeTeamCardFallback = function (speciesId) {
 let msgQueue = [];
 let msgResolve = null;
 const MSG_AUTO_MS = 750;
-const LOG_STACK_MAX = 5;
+const LOG_STACK_MAX = 6;
 let logLines = [];
+
+// 「ログを見る」オーバーレイ用の履歴（最大30件、古い→新しいの時系列順に描画する）。
+const BATTLE_LOG_HISTORY_MAX = 30;
+let battleLogHistory = [];
+function pushBattleLogHistory(entry) {
+  battleLogHistory.push(entry);
+  while (battleLogHistory.length > BATTLE_LOG_HISTORY_MAX) battleLogHistory.shift();
+}
 
 function queueMessage(text, after, netMeta) {
   msgQueue.push({ text, after });
@@ -307,9 +356,26 @@ function queueMessage(text, after, netMeta) {
       h: netMeta && netMeta.hit ? netMeta.hit : null,
       hp: netMeta && netMeta.hp !== undefined ? netMeta.hp : null,
       f: netMeta && netMeta.faint ? netMeta.faint : null,
+      mu: netMeta && netMeta.moveUse ? netMeta.moveUse : null,
+      sid: netMeta && netMeta.speciesId !== undefined ? netMeta.speciesId : null,
+      sh: netMeta && netMeta.shiny ? netMeta.shiny : false,
+      tm: netMeta && netMeta.typeMult !== undefined ? netMeta.typeMult : null,
+      rc: netMeta && netMeta.rankChange ? netMeta.rankChange : null,
+      rs: netMeta && netMeta.rankSide ? netMeta.rankSide : null,
+      mt: netMeta && netMeta.moveType ? netMeta.moveType : null,
+      turn: netMeta && netMeta.turn ? netMeta.turn : null,
     });
   }
 }
+
+// ターン区切り（--ターンN--）をメッセージキューとログ履歴の両方に積む。
+// netMeta.turn を立てて送ることで、ゲスト側でも同じ区切りをログ履歴に残せるようにする。
+function queueTurnDivider(turnNumber) {
+  const text = `--ターン${turnNumber}--`;
+  queueMessage(text, null, { turn: true });
+  pushBattleLogHistory({ text, side: null, kind: 'turn', speciesId: null, shiny: false });
+}
+
 function hideMessageToast() {}
 function pushLogLine(text) {
   const stack = $('battle-log-stack');
@@ -403,6 +469,50 @@ function flashHit(side) {
   img.classList.add('hit');
   return new Promise((res) => setTimeout(() => { img.classList.remove('hit'); res(); }, 160));
 }
+
+// 能力ランク変化エフェクト（ダイヤモンド・パール風：上昇=赤フラッシュ／下降=青フラッシュ）。
+// スプライトと同じ画像をマスクに使い、ポケモンのドット絵の輪郭に沿って光らせる。
+// CSSでの中央寄せ（absolute+margin:auto）はスプライトのflex中央配置とズレることがあるため、
+// img要素の実際の描画位置・サイズを getBoundingClientRect で取得し、そこに正確に重ねる。
+// direction: 'up' | 'down'
+const RANK_FX_DURATION_MS = 500;
+function rankFlash(side, direction) {
+  const wrap = $(side === 'opp' ? 'sprite-opp-wrap' : 'sprite-self-wrap');
+  if (!wrap) return Promise.resolve();
+  const img = wrap.querySelector('img, .sprite-fallback');
+  if (!img) return Promise.resolve();
+
+  const wrapRect = wrap.getBoundingClientRect();
+  const imgRect = img.getBoundingClientRect();
+
+  const overlay = document.createElement('div');
+  overlay.className = `rank-fx-overlay ${direction === 'up' ? 'rank-fx-up' : 'rank-fx-down'}`;
+  // wrap（position:relative の基準）から見た img の相対位置・サイズに正確に合わせる。
+  overlay.style.position = 'absolute';
+  overlay.style.left = (imgRect.left - wrapRect.left) + 'px';
+  overlay.style.top = (imgRect.top - wrapRect.top) + 'px';
+  overlay.style.width = imgRect.width + 'px';
+  overlay.style.height = imgRect.height + 'px';
+  if (img.tagName === 'IMG' && img.src) {
+    overlay.style.webkitMaskImage = `url(${img.src})`;
+    overlay.style.maskImage = `url(${img.src})`;
+  }
+  // self側のスプライトは左右反転表示されているため、オーバーレイのマスクも合わせて反転する。
+  if (side === 'self') {
+    overlay.style.transform = 'scaleX(-1)';
+  }
+  wrap.appendChild(overlay);
+
+  if (direction === 'up') playRankUpSound();
+  else playRankDownSound();
+
+  return new Promise((res) => {
+    setTimeout(() => {
+      overlay.remove();
+      res();
+    }, RANK_FX_DURATION_MS);
+  });
+}
 function playFaint(side) {
   const wrap = $(side === 'opp' ? 'sprite-opp-wrap' : 'sprite-self-wrap');
   const img = wrap.querySelector('img, .sprite-fallback');
@@ -411,9 +521,60 @@ function playFaint(side) {
   return new Promise((res) => setTimeout(res, 350));
 }
 
+// タイプ技の簡易エフェクト（1:むし〜12:じめん、+こおり）。
+// sprite-slot（position:relative）の中に一時的なオーバーレイを差し込み、
+// アニメーション終了後に自動で取り除く。
+const TYPE_EFFECT_CONFIG = {
+  bug:      { emoji: '🍃', cls: 'tfx-bug' },
+  dark:     { emoji: '🌑', cls: 'tfx-dark' },
+  dragon:   { emoji: '🌀', cls: 'tfx-dragon' },
+  electric: { emoji: '⚡', cls: 'tfx-electric' },
+  fairy:    { emoji: '✨', cls: 'tfx-fairy' },
+  fighting: { emoji: '💥', cls: 'tfx-fighting' },
+  fire:     { emoji: '🔥', cls: 'tfx-fire' },
+  flying:   { emoji: '🌪️', cls: 'tfx-flying' },
+  ghost:    { emoji: '👻', cls: 'tfx-ghost' },
+  grass:    { emoji: '🌿', cls: 'tfx-grass' },
+  ground:   { emoji: '🪨', cls: 'tfx-ground' },
+  ice:      { emoji: '❄️', cls: 'tfx-ice' },
+  normal:   { emoji: '⭐', cls: 'tfx-normal' },
+  poison:   { emoji: '☠️', cls: 'tfx-poison' },
+  psychic:  { emoji: '🔮', cls: 'tfx-psychic' },
+  rock:     { emoji: '⛰️', cls: 'tfx-rock' },
+  steel:    { emoji: '⚙️', cls: 'tfx-steel' },
+  water:    { emoji: '💧', cls: 'tfx-water' },
+  sound:    { emoji: '🎵', cls: 'tfx-sound' },
+  shine:    { emoji: '🌟', cls: 'tfx-shine' },
+};
+const TYPE_EFFECT_DURATION_MS = 420;
+function playTypeEffect(side, moveType) {
+  const wrap = $(side === 'opp' ? 'sprite-opp-wrap' : 'sprite-self-wrap');
+  if (!wrap) return Promise.resolve();
+  // むし〜じめん（+こおり）は本格的なCanvasパーティクル演出。
+  // 未対応タイプ（sound/shineなど演出専用の疑似タイプ）は
+  // 従来の絵文字オーバーレイにフォールバックする。
+  if (window.TypeFX && window.TypeFX.SUPPORTED_TYPES.indexOf(moveType) !== -1) {
+    const p = window.TypeFX.play(wrap, moveType);
+    if (p) return p;
+  }
+  const config = TYPE_EFFECT_CONFIG[moveType];
+  if (!config) return Promise.resolve();
+  const fx = document.createElement('div');
+  fx.className = `type-fx ${config.cls}`;
+  fx.textContent = config.emoji;
+  wrap.appendChild(fx);
+  return new Promise((res) => {
+    setTimeout(() => {
+      fx.remove();
+      res();
+    }, TYPE_EFFECT_DURATION_MS);
+  });
+}
+
 /* ---------------- Command panel rendering ---------------- */
 function renderActionMenu() {
   closeWatchOverlay();
+  closeLogOverlay();
   const dock = $('cmd-dock');
   dock.classList.remove('dock-wide');
   const panel = $('cmd-panel');
@@ -423,7 +584,7 @@ function renderActionMenu() {
     <button class="neu-btn cmd-btn" id="act-fight">たたかう</button>
     <button class="neu-btn cmd-btn" id="act-switch">ポケモン</button>
   `;
-  $('act-watch').disabled = false;
+  setWatchLogButtonsActive(true);
   $('act-watch').onclick = () => openWatchOverlay();
   $('act-fight').addEventListener('click', () => renderMoveMenu());
   $('act-switch').addEventListener('click', () => {
@@ -449,6 +610,10 @@ function isTrappedByKagefumi(self, opponent) {
   return opponent.ability === 121; // かげふみ
 }
 
+function isDeaigashiraLockedFor(poke, m) {
+  return m.id === 4 && poke.deaigashiraLocked;
+}
+
 function renderMoveMenu() {
   const dock = $('cmd-dock');
   dock.classList.add('dock-wide');
@@ -456,14 +621,23 @@ function renderMoveMenu() {
   panel.style.cssText = '';
   panel.className = 'cmd-panel move-list';
   const poke = state.playerActive;
-  const moveButtons = poke.moves.map((m, idx) => `
-    <button class="neu-btn cmd-btn move-row ${TYPE_CLASS(m.type)}-edge" data-idx="${idx}" ${(m.pp <= 0 || m.locked) ? 'disabled' : ''}>
+  // げきりん強制中は、その技のみ選択可能（自動選択でもよいが、UIとしては強制技のみ表示）
+  const gekirinForced = poke.gekirinTurns > 0 && poke.gekirinMoveId !== null
+    ? poke.moves.find(m => m.id === poke.gekirinMoveId)
+    : null;
+  const moveButtons = poke.moves.map((m, idx) => {
+    const deaiLocked = isDeaigashiraLockedFor(poke, m);
+    const gekirinLocked = gekirinForced && m.id !== gekirinForced.id;
+    const disabled = m.pp <= 0 || m.locked || deaiLocked || gekirinLocked;
+    return `
+    <button class="neu-btn cmd-btn move-row ${TYPE_CLASS(m.type)}-edge" data-idx="${idx}" ${disabled ? 'disabled' : ''}>
       ${typeIconHtml(m.type)}
       <span class="move-row-name">${m.name}</span>
       <span class="move-row-pp">PP ${m.pp}/${m.maxPp}</span>
-      ${m.locked ? '<span style="color:#ff5d5d;font-size:10px;font-weight:900;">🔒</span>' : ''}
+      ${(m.locked || deaiLocked) ? '<span style="color:#ff5d5d;font-size:10px;font-weight:900;">🔒</span>' : ''}
     </button>
-  `).join('');
+  `;
+  }).join('');
   panel.innerHTML = moveButtons + `
     <button class="neu-btn cmd-btn move-row-back" id="act-move-back">もどる</button>
   `;
@@ -474,7 +648,7 @@ function renderMoveMenu() {
     });
   });
   $('act-move-back').addEventListener('click', () => renderActionMenu());
-  $('act-watch').disabled = false;
+  setWatchLogButtonsActive(true);
   $('act-watch').onclick = () => openWatchOverlay();
 }
 
@@ -697,6 +871,19 @@ function renderWatchOverlay() {
   renderWatchField();
 }
 
+function setWatchLogButtonsActive(active) {
+  const watchBtn = $('act-watch');
+  const logBtn = $('act-log');
+  watchBtn.disabled = !active;
+  if (active) {
+    watchBtn.classList.remove('hide-when-acting');
+    logBtn.classList.remove('hide-when-acting');
+  } else {
+    watchBtn.classList.add('hide-when-acting');
+    logBtn.classList.add('hide-when-acting');
+  }
+}
+
 function openWatchOverlay() {
   watchSelectedSide = 'self';
   renderWatchOverlay();
@@ -706,6 +893,47 @@ function closeWatchOverlay() {
   $('watch-overlay').classList.remove('show');
 }
 $('watch-close').addEventListener('click', () => closeWatchOverlay());
+
+/* ---------------- Battle log overlay（ログを見る） ---------------- */
+function logEntryHtml(entry) {
+  if (entry.kind === 'turn') {
+    return `<div class="log-turn-divider">${entry.text}</div>`;
+  }
+  const sideClass = entry.side ? `side-${entry.side === 'player' ? 'player' : 'cpu'}` : '';
+  const kindClass = `kind-${entry.kind}`;
+  const tag = entry.kind === 'move' ? 'わざ' : (entry.kind === 'damage' ? 'HP減少' : '');
+  let iconHtml = '';
+  if (entry.speciesId) {
+    const src = `./${entry.speciesId}${entry.shiny ? 's' : ''}.png`;
+    iconHtml = `<img src="${src}" class="log-entry-icon" onerror="this.style.visibility='hidden'">`;
+  }
+  return `
+    <div class="log-entry ${sideClass} ${kindClass}">
+      ${iconHtml}
+      <span class="log-entry-text">${tag ? `<span class="log-entry-tag">${tag}</span>` : ''}${entry.text}</span>
+    </div>
+  `;
+}
+function renderLogOverlay() {
+  const list = $('log-panel-list');
+  if (battleLogHistory.length === 0) {
+    list.innerHTML = `<div class="log-panel-empty">まだログがありません</div>`;
+    return;
+  }
+  // 上が古い、下が最新の時系列順で描画する。
+  list.innerHTML = battleLogHistory.map((e) => logEntryHtml(e)).join('');
+  // 開いた直後は一番下（＝最新）が見えるようにスクロールしておく。
+  list.scrollTop = list.scrollHeight;
+}
+function openLogOverlay() {
+  renderLogOverlay();
+  $('log-overlay').classList.add('show');
+}
+function closeLogOverlay() {
+  $('log-overlay').classList.remove('show');
+}
+$('log-close').addEventListener('click', () => closeLogOverlay());
+$('act-log').addEventListener('click', () => openLogOverlay());
 
 function renderSwitchMenu() {
   openPartyOverlay('switch');
@@ -1051,14 +1279,14 @@ function playerChooseMove(move) {
   const action = { type: 'move', move };
   $('cmd-panel').innerHTML = '';
   $('cmd-dock').classList.remove('dock-wide');
-  $('act-watch').disabled = true;
+  setWatchLogButtonsActive(false);
   if (turnResolve) { const r = turnResolve; turnResolve = null; r(action); }
 }
 function playerChooseSwitch(idx) {
   const action = { type: 'switch', idx };
   $('cmd-panel').innerHTML = '';
   $('cmd-dock').classList.remove('dock-wide');
-  $('act-watch').disabled = true;
+  setWatchLogButtonsActive(false);
   if (turnResolve) { const r = turnResolve; turnResolve = null; r(action); }
 }
 
@@ -1085,22 +1313,66 @@ function makeLogFn() {
       const poke = meta.hit === 'player' ? state.playerActive : state.cpuActive;
       hpSnapshot = poke ? poke.currentHp : 0;
     }
+
+    // 能力ランク変化がどちら側のポケモンに起きたか（'player'|'cpu'→'self'|'opp'）
+    let rankUiSide = null;
+    if (meta && meta.rankChange && meta.rankSide) {
+      rankUiSide = meta.rankSide === 'player' ? 'self' : 'opp';
+    }
+
+    // ログ履歴（「ログを見る」オーバーレイ用）に記録。
+    let logSide = null, logKind = 'plain', logSpeciesId = null, logShiny = false;
+    if (meta && meta.moveUse) {
+      const poke = meta.moveUse === 'player' ? state.playerActive : state.cpuActive;
+      logSide = meta.moveUse; logKind = 'move';
+      logSpeciesId = poke ? poke.speciesId : null; logShiny = poke ? poke.shiny : false;
+    } else if (meta && meta.hit) {
+      const poke = meta.hit === 'player' ? state.playerActive : state.cpuActive;
+      logSide = meta.hit; logKind = 'damage';
+      logSpeciesId = poke ? poke.speciesId : null; logShiny = poke ? poke.shiny : false;
+    }
+    pushBattleLogHistory({ text, side: logSide, kind: logKind, speciesId: logSpeciesId, shiny: logShiny });
+
+    const moveType = meta && meta.moveType ? meta.moveType : null;
+
     queueMessage(text, async () => {
       if (uiSide) {
+        // タイプ別の簡易エフェクト → 効果音 → ヒット演出 → HP反映、の順で見せる
+        if (moveType) {
+          await playTypeEffect(uiSide, moveType);
+        }
+        if (meta && meta.typeMult !== undefined) {
+          playTypeEffectSound(meta.typeMult);
+        }
         await flashHit(uiSide);
         const poke = meta.hit === 'player' ? state.playerActive : state.cpuActive;
         updateHud(poke, uiSide, hpSnapshot);
+      }
+      // 能力ランク変化：このログ行が画面に表示されるタイミングでエフェクト＋効果音を同時再生し、
+      // エフェクトが終わるまでバトル進行（次のメッセージ）を待たせる。
+      if (rankUiSide) {
+        await rankFlash(rankUiSide, meta.rankChange);
       }
     }, {
       hit: meta && meta.hit ? meta.hit : null,
       hp: hpSnapshot,
       faint: meta && meta.faint ? meta.faint : null,
+      moveUse: meta && meta.moveUse ? meta.moveUse : null,
+      speciesId: logSpeciesId,
+      shiny: logShiny,
+      typeMult: meta && meta.typeMult !== undefined ? meta.typeMult : null,
+      rankChange: meta && meta.rankChange ? meta.rankChange : null,
+      rankSide: meta && meta.rankSide ? meta.rankSide : null,
+      moveType: moveType,
     });
   };
 }
 
 async function doSwitch(newActive, side) {
   newActive.side = side;
+  newActive.deaigashiraLocked = false; // 場に出た最初のターンはであいがしら使用可能
+  newActive.gekirinTurns = 0; // 交代でげきりんの強制状態は解除
+  newActive.gekirinMoveId = null;
   if (side === 'player') {
     state.playerActive = newActive;
     setSprite(newActive, 'self');
@@ -1212,6 +1484,7 @@ async function resolveImmediateSwitch(side) {
 
 async function runBattleLoop() {
   state.battleBusy = true;
+  battleLogHistory = [];
   BattleBgm.start();
   state.playerActive.side = 'player';
   state.cpuActive.side = 'cpu';
@@ -1232,9 +1505,14 @@ async function runBattleLoop() {
   await drainMessages();
   updateFieldDisplay();
 
+  state.turnNumber = 1;
+
   while (true) {
     if (state.playerTeam.every((p) => p.fainted)) { await endBattle(false); return; }
     if (state.cpuTeam.every((p) => p.fainted)) { await endBattle(true); return; }
+
+    queueTurnDivider(state.turnNumber);
+    await drainMessages();
 
     const playerAction = await waitForPlayerAction();
 
@@ -1251,6 +1529,7 @@ async function runBattleLoop() {
         await drainMessages();
       }
       await postTurnCleanupAndRender();
+      state.turnNumber++;
       continue;
     }
 
@@ -1258,6 +1537,7 @@ async function runBattleLoop() {
     await runTurn(playerAction, cpuAction, state.playerActive, state.cpuActive, makeLogFn(), resolveImmediateSwitch);
     await drainMessages();
     await postTurnCleanupAndRender();
+    state.turnNumber++;
   }
 }
 
@@ -1289,7 +1569,7 @@ async function postTurnCleanupAndRender() {
 
 function waitForForcedSwitch() {
   $('cmd-dock').classList.remove('dock-wide');
-  $('act-watch').disabled = true;
+  setWatchLogButtonsActive(false);
   $('cmd-panel').innerHTML = '';
   return new Promise((resolve) => {
     forcedSwitchResolve = resolve;
@@ -1440,6 +1720,9 @@ function resetPokeForBattle(poke) {
   poke.encoreTurns = 0;
   poke.utsusemiTurns = 0;
   poke.infernoUsed = false;
+  poke.deaigashiraLocked = false;
+  poke.gekirinTurns = 0;
+  poke.gekirinMoveId = null;
 }
 
 function startNextCpuBattle() {
@@ -1638,25 +1921,25 @@ function showMultiplayerMenu() {
   showScreen('multiplayer');
 }
 
-let nameModalMode = 'create';
+/* 名前入力を廃止したため、表示用のプレイヤー名は自動生成する */
+function generateAutoPlayerName() {
+  const n = 1000 + Math.floor(Math.random() * 9000);
+  return `トレーナー${n}`;
+}
 
 function updateNameCharCount() {
-  const nameLen = ($('input-player-name').value || '').length;
-  $('name-char-count').textContent = nameLen;
   const codeLen = ($('input-room-code').value || '').length;
   $('code-char-count').textContent = codeLen;
 }
 
-function openNameModal(mode) {
-  nameModalMode = mode;
-  $('name-modal-title').textContent = mode === 'create' ? 'ルームを作成' : 'あいことばで入室';
-  $('join-code-field').style.display = mode === 'join' ? '' : 'none';
-  $('input-player-name').value = state.playerName || '';
+function openNameModal() {
+  // 「あいことばで入室」専用モーダル（ルーム作成は名前入力なしで即実行するため呼ばれない）
+  $('name-modal-title').textContent = 'あいことばで入室';
   $('input-room-code').value = '';
   updateNameCharCount();
   $('name-modal').classList.add('show');
   setTimeout(() => {
-    try { $('input-player-name').focus(); } catch (e) {}
+    try { $('input-room-code').focus(); } catch (e) {}
   }, 60);
 }
 
@@ -1665,22 +1948,36 @@ function closeNameModal() {
 }
 
 function onNameModalConfirm() {
-  const name = ($('input-player-name').value || '').trim();
-  if (!name) { $('input-player-name').focus(); return; }
-  state.playerName = name;
+  const code = ($('input-room-code').value || '').trim();
+  if (!/^\d{4}$/.test(code)) { $('input-room-code').focus(); return; }
+  if (!state.playerName) state.playerName = generateAutoPlayerName();
+  closeNameModal();
+  joinRoom(code);
+}
 
-  if (nameModalMode === 'create') {
-    closeNameModal();
-    startHostRoom();
-  } else {
-    const code = ($('input-room-code').value || '').trim();
-    if (!/^\d{4}$/.test(code)) { $('input-room-code').focus(); return; }
-    closeNameModal();
-    joinRoom(code);
-  }
+/* ---- 相手が離脱した時の共通処理 ---- */
+let roomClosedHandled = false;
+function forceLeaveOnRoomClosed() {
+  if (roomClosedHandled) return;
+  roomClosedHandled = true;
+  state.multiplayer = false;
+  state.battleBusy = false;
+  BattleBgm.stop();
+  try { $('pick-overlay').classList.remove('show'); } catch (e) {}
+  try { $('negotiate-overlay').classList.remove('show'); } catch (e) {}
+  try { $('nego-wait-overlay').classList.remove('show'); } catch (e) {}
+  try { $('result-overlay').classList.remove('show'); } catch (e) {}
+  try { $('rematch-overlay').classList.remove('show'); } catch (e) {}
+  clearNegoTimer();
+  clearPickTimer();
+  Net.reset();
+  MenuBgm.start();
+  showScreen('title');
+  alert('相手が退出したため、部屋を閉じました。');
 }
 
 async function startHostRoom() {
+  roomClosedHandled = false;
   state.isHost = true;
   let code = null;
   for (let i = 0; i < 8; i++) {
@@ -1702,6 +1999,8 @@ async function startHostRoom() {
   showScreen('host-waiting');
   MenuBgm.start();
 
+  Net.onRoomClosed(() => forceLeaveOnRoomClosed());
+
   Net.onGuestJoined((guestName) => {
     state.opponentName = guestName;
     $('host-wait-hint').textContent = `${guestName} さんが入室しました！`;
@@ -1710,6 +2009,7 @@ async function startHostRoom() {
 }
 
 async function joinRoom(code) {
+  roomClosedHandled = false;
   state.isHost = false;
   const r = await Net.joinRoom(code, state.playerName);
   if (r === 'not-found') { alert('そのルームは見つかりませんでした。'); return; }
@@ -1723,6 +2023,8 @@ async function joinRoom(code) {
   $('host-wait-cancel').textContent = 'もどる';
   showScreen('host-waiting');
   MenuBgm.start();
+
+  Net.onRoomClosed(() => forceLeaveOnRoomClosed());
 
   Net.onStatusChange((status) => {
     if (status === 'both-in') { startMultiplayerPick(); }
@@ -1804,6 +2106,14 @@ function renderNegoCards() {
   $('btn-nego-swap').disabled = negoSwapsLeft <= 0;
 }
 
+$('nego-cards').addEventListener('click', (e) => {
+  const infoBtn = e.target.closest('.tpc-info-btn');
+  if (infoBtn) {
+    const idx = parseInt(infoBtn.dataset.infoIdx, 10);
+    showTradeDetail(state.playerTeam[idx]);
+  }
+});
+
 function runNegotiatePhase() {
   return new Promise((resolve) => {
     negoSwapsLeft = NEGO_SWAP_MAX;
@@ -1870,6 +2180,7 @@ function runNegotiatePhase() {
 function openNegoReorderOverlay() {
   negoArmedIdx = null;
   renderNegoReorderCards();
+  $('negotiate-overlay').classList.remove('show');
   $('nego-reorder-overlay').classList.add('show');
 }
 
@@ -1911,6 +2222,7 @@ $('nego-reorder-cards').addEventListener('click', (e) => {
 $('btn-nego-reorder-done').addEventListener('click', () => {
   $('nego-reorder-overlay').classList.remove('show');
   renderNegoCards();
+  $('negotiate-overlay').classList.add('show');
 });
 
 /* ---- 手持ちを変える（ランダム3匹から1匹→手持ちの1匹と交換） ---- */
@@ -1921,13 +2233,10 @@ function openNegoSwapOverlay(onDone) {
   negoSwapPool = ids.map((id) => createRandomPokemon(id, 100));
   const offerRow = $('nego-swap-offer-row');
   offerRow.innerHTML = negoSwapPool.map((p, idx) => tradeCardHtml(p, idx, false)).join('');
+  $('negotiate-overlay').classList.remove('show');
   $('nego-swap-overlay').classList.add('show');
 
-  const onCancel = () => {
-    offerRow.removeEventListener('click', onOfferClick);
-    $('btn-nego-swap-cancel').removeEventListener('click', onCancel);
-    $('nego-swap-overlay').classList.remove('show');
-  };
+  // 「やめる」で選び直し（リセマラ）できないよう、一度開いたら必ず1匹選んで交換する仕様。
 
   const onOfferClick = async (e) => {
     const infoBtn = e.target.closest('.tpc-info-btn');
@@ -1943,13 +2252,11 @@ function openNegoSwapOverlay(onDone) {
     const ok = await askConfirm(`${chosen.species.name}をもらいますか？`);
     if (!ok) return;
     offerRow.removeEventListener('click', onOfferClick);
-    $('btn-nego-swap-cancel').removeEventListener('click', onCancel);
     $('nego-swap-overlay').classList.remove('show');
     openNegoSwapReplaceOverlay(chosen, onDone);
   };
 
   offerRow.addEventListener('click', onOfferClick);
-  $('btn-nego-swap-cancel').addEventListener('click', onCancel);
 }
 
 function openNegoSwapReplaceOverlay(incoming, onDone) {
@@ -1974,6 +2281,7 @@ function openNegoSwapReplaceOverlay(incoming, onDone) {
     if (!ok) return;
     replaceRow.removeEventListener('click', onReplaceClick);
     replaceOverlay.classList.remove('show');
+    $('negotiate-overlay').classList.add('show');
 
     const incomingCopy = Object.assign({}, incoming);
     incomingCopy.moves = incoming.moves.map((m) => Object.assign({}, m));
@@ -2049,9 +2357,14 @@ async function runMultiplayerBattleHost() {
 
   await Net.pushEvent({ k: 'turn-end' });
 
+  state.turnNumber = 1;
+
   while (true) {
     if (state.playerTeam.every((p) => p.fainted)) { await endMultiplayerBattleHost(true); return; }
     if (state.cpuTeam.every((p) => p.fainted)) { await endMultiplayerBattleHost(false); return; }
+
+    queueTurnDivider(state.turnNumber);
+    await drainMessages();
 
     const myAction = await waitForPlayerAction();
     await Net.sendAction(myAction);
@@ -2081,6 +2394,7 @@ async function runMultiplayerBattleHost() {
     }
 
     await postTurnCleanupMultiplayerHost();
+    state.turnNumber++;
 
     await Net.pushEvent({ k: 'turn-end' });
   }
@@ -2167,13 +2481,73 @@ async function endMultiplayerBattleHost(hostWon) {
   $('result-desc').textContent = hostWon ? '勝利！' : '敗北…';
   overlay.classList.add('show');
   Net.pushEvent({ k: 'end', win: hostWon });
-  $('btn-result-next').onclick = async () => {
-    overlay.classList.remove('show');
+  await runMultiplayerRematchFlow();
+}
+
+/* =========================================================
+   対人戦終了後：連戦する/抜けるの選択フロー（ホスト・ゲスト共通）
+   ========================================================= */
+async function runMultiplayerRematchFlow() {
+  const overlay = $('result-overlay');
+  const waitOverlay = $('rematch-wait-overlay');
+  $('btn-result-next').style.display = 'none';
+  $('result-mp-actions').style.display = 'flex';
+
+  const choice = await new Promise((resolve) => {
+    const onRematch = () => {
+      $('btn-mp-rematch').removeEventListener('click', onRematch);
+      $('btn-mp-leave').removeEventListener('click', onLeave);
+      resolve('rematch');
+    };
+    const onLeave = () => {
+      $('btn-mp-rematch').removeEventListener('click', onRematch);
+      $('btn-mp-leave').removeEventListener('click', onLeave);
+      resolve('leave');
+    };
+    $('btn-mp-rematch').addEventListener('click', onRematch);
+    $('btn-mp-leave').addEventListener('click', onLeave);
+  });
+
+  overlay.classList.remove('show');
+  $('result-mp-actions').style.display = 'none';
+  $('btn-result-next').style.display = '';
+
+  if (choice === 'leave') {
+    roomClosedHandled = true; // 自分から明示的に退出するので、切断検知の二重処理を防ぐ
     await Net.leave();
     state.multiplayer = false;
     MenuBgm.start();
     showScreen('title');
-  };
+    return;
+  }
+
+  // 連戦を希望 → 相手の意思を待つ
+  await Net.setRematchChoice('rematch');
+  waitOverlay.classList.add('show');
+  $('rematch-wait-desc').textContent = '相手の返事を待っています…';
+
+  const opponentChoice = await new Promise((resolve) => {
+    Net.onOpponentRematchChoice((v) => resolve(v));
+  });
+
+  waitOverlay.classList.remove('show');
+
+  if (opponentChoice === 'leave') {
+    roomClosedHandled = true; // 相手の退出はここで処理するので、切断検知の二重処理を防ぐ
+    alert('相手が退出したため、部屋を閉じました。');
+    await Net.leave();
+    state.multiplayer = false;
+    MenuBgm.start();
+    showScreen('title');
+    return;
+  }
+
+  // 両者が連戦を希望 → 次戦の準備
+  await Net.clearRematch();
+  if (state.isHost) {
+    await Net.resetForNextBattle();
+  }
+  startMultiplayerPick();
 }
 
 /* =========================================================
@@ -2208,12 +2582,43 @@ async function handleGuestEvent(ev) {
     const poke = ev.h === 'player' ? state.cpuActive : ev.h === 'cpu' ? state.playerActive : null;
     const hpSnapshot = ev.hp;
 
+    // 能力ランク変化がどちら側に起きたか（ホスト視点 player/cpu → ゲスト画面の opp/self に変換）
+    const rankUiSide = ev.rc && ev.rs ? (ev.rs === 'player' ? 'opp' : 'self') : null;
+
+    // ログ履歴（「ログを見る」オーバーレイ用）。ホスト視点の player/cpu を
+    // ゲスト画面上の自分（self）/相手（opp）に対応する player/cpu 表記へ変換する。
+    // ゲスト画面では「自分」=ホスト視点の cpu 側、「相手」=ホスト視点の player 側。
+    let logSide = null, logKind = 'plain';
+    if (ev.turn) {
+      logKind = 'turn';
+    } else if (ev.mu) {
+      logSide = ev.mu === 'cpu' ? 'player' : 'cpu'; // 自分=player表記, 相手=cpu表記に揃える
+      logKind = 'move';
+    } else if (ev.h) {
+      logSide = ev.h === 'cpu' ? 'player' : 'cpu';
+      logKind = 'damage';
+    }
+    if (logSide) {
+      pushBattleLogHistory({ text: ev.t, side: logSide, kind: logKind, speciesId: ev.sid, shiny: ev.sh });
+    } else {
+      pushBattleLogHistory({ text: ev.t, side: null, kind: logKind, speciesId: null, shiny: false });
+    }
+
     msgQueue.push({
       text: ev.t,
       after: async () => {
         if (uiSide && poke) {
+          if (ev.mt) {
+            await playTypeEffect(uiSide, ev.mt);
+          }
+          if (ev.tm !== null && ev.tm !== undefined) {
+            playTypeEffectSound(ev.tm);
+          }
           await flashHit(uiSide);
           updateHud(poke, uiSide, hpSnapshot);
+        }
+        if (rankUiSide) {
+          await rankFlash(rankUiSide, ev.rc);
         }
         if (ev.f) {
           const fUiSide = ev.f === 'player' ? 'opp' : 'self';
@@ -2266,13 +2671,7 @@ async function handleGuestEvent(ev) {
     $('result-title').className = 'result-title ' + (guestWon ? 'win' : 'lose');
     $('result-desc').textContent = guestWon ? '勝利！' : '敗北…';
     overlay.classList.add('show');
-    $('btn-result-next').onclick = async () => {
-      overlay.classList.remove('show');
-      await Net.leave();
-      state.multiplayer = false;
-      MenuBgm.start();
-      showScreen('title');
-    };
+    await runMultiplayerRematchFlow();
     return;
   }
 }
@@ -2294,7 +2693,7 @@ async function playGuestMessages() {
 
 function waitGuestForcedSwitch() {
   $('cmd-dock').classList.remove('dock-wide');
-  $('act-watch').disabled = true;
+  setWatchLogButtonsActive(false);
   $('cmd-panel').innerHTML = '';
   return new Promise((resolve) => {
     forcedSwitchResolve = (idx) => {
@@ -2337,30 +2736,26 @@ function resolveRemoteAction(raw, remotePoke) {
 }
 
 /* ---------------- Wiring ---------------- */
-$('btn-npc-battle').addEventListener('click', () => { startNewRun(); });
-$('btn-player-battle').addEventListener('click', () => { showMultiplayerMenu(); });
+$('btn-npc-battle').addEventListener('click', () => { startMenuBgmOnFirstInteraction(); startNewRun(); });
+$('btn-player-battle').addEventListener('click', () => { startMenuBgmOnFirstInteraction(); showMultiplayerMenu(); });
 $('btn-to-battle').addEventListener('click', () => { startNextCpuBattle(); });
 
-$('btn-create-room').addEventListener('click', () => openNameModal('create'));
-$('btn-join-room').addEventListener('click', () => openNameModal('join'));
+$('btn-create-room').addEventListener('click', () => {
+  // 名前入力なしで即ルーム作成
+  if (!state.playerName) state.playerName = generateAutoPlayerName();
+  startHostRoom();
+});
+$('btn-join-room').addEventListener('click', () => openNameModal());
 $('multi-back-to-title').addEventListener('click', () => showScreen('title'));
 
 $('name-modal-cancel').addEventListener('click', () => closeNameModal());
 $('name-modal-confirm').addEventListener('click', () => onNameModalConfirm());
-$('input-player-name').addEventListener('input', updateNameCharCount);
 
 $('input-room-code').addEventListener('input', (e) => {
   e.target.value = (e.target.value || '').replace(/\D/g, '').slice(0, 4);
   updateNameCharCount();
 });
 
-$('input-player-name').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    if (nameModalMode === 'create') onNameModalConfirm();
-    else $('input-room-code').focus();
-  }
-});
 $('input-room-code').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); onNameModalConfirm(); }
 });

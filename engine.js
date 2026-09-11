@@ -203,6 +203,9 @@ function createRandomPokemon(speciesId, level = 100) {
     encoreTurns: 0,         // アンコール残りターン
     utsusemiTurns: 0,       // うつせみカウント（相手に付与）
     infernoUsed: false,     // インフェルノを使用したフラグ
+    deaigashiraLocked: false, // であいがしら：登場ターン以外はロック（交代で解除）
+    gekirinTurns: 0,        // げきりん：強制連続使用の残りターン数
+    gekirinMoveId: null,    // げきりん：強制されている技ID
   };
 }
 
@@ -489,7 +492,10 @@ function applyRankChange(target, rankData, logFn, attackerAbility) {
   };
   const flushGroups = () => {
     groups.forEach((names, phrase) => {
-      logFn(`${target.species.name}の${formatStatNameList(names)}が\n${phrase}`);
+      const rankMeta = phrase.includes('上がった')
+        ? { rankChange: 'up', rankSide: target.side }
+        : { rankChange: 'down', rankSide: target.side };
+      logFn(`${target.species.name}の${formatStatNameList(names)}が\n${phrase}`, rankMeta);
     });
     groups.clear();
   };
@@ -538,12 +544,6 @@ function applyRankChange(target, rankData, logFn, attackerAbility) {
           const boostData = [100, 0, 0, 2, 0, 0, 0, 0];
           applyRankChange(target, boostData, logFn);
           logFn(`${target.species.name}のかちきが発動！`);
-        }
-        if (k === 'atk' && target.ability === ABILITY.TOUSOUSHIN) {
-          flushGroups();
-          const boostData = [100, 2, 0, 0, 0, 0, 0, 0];
-          applyRankChange(target, boostData, logFn);
-          logFn(`${target.species.name}のとうそうしんが発動！`);
         }
       }
     }
@@ -1336,7 +1336,7 @@ function executeMultiHit(attacker, defender, move, logFn) {
 
     defender.currentHp = Math.max(0, defender.currentHp - damage);
     if (survivedByGanjou) defender.currentHp = 1;
-    logFn(`${defender.species.name}に${damage}のダメージ！`, { hit: defender.side });
+    logFn(`${defender.species.name}に${damage}のダメージ！`, { hit: defender.side, typeMult, moveType: move.type });
     if (isCrit) logFn('急所に当たった！');
     if (typeMult > 1) logFn('効果は抜群だ！');
     else if (typeMult < 1) logFn('効果は今ひとつのようだ…');
@@ -1370,16 +1370,18 @@ function executeMultiHit(attacker, defender, move, logFn) {
     if (defender.currentHp <= 0) {
       defender.fainted = true;
       logFn(`${defender.species.name}は倒れた！`, { faint: defender.side });
+      anyHit = true;
       break;
     }
     anyHit = true;
   }
 
   // ランク変化（selfRank/oppRank）は連続ヒットの回数分ではなく、技を出した時に1回だけ適用する。
+  // 相手を倒した一撃であっても技自体は命中しているため、selfRank（自分の能力変化）は発動する。
   if (anyHit && !attacker.fainted) {
     const suppressSecondary = attacker.ability === ABILITY.CHIKARAZUKU;
     if (!suppressSecondary) {
-      applyRankChange(defender, move.oppRank, logFn);
+      if (!defender.fainted) applyRankChange(defender, move.oppRank, logFn);
       applyRankChange(attacker, move.selfRank, logFn);
     }
   }
@@ -1456,6 +1458,14 @@ function executeMove(attacker, defender, move, logFn) {
     }
   }
 
+  // ---- げきりん強制連続使用チェック ----
+  if (attacker.gekirinTurns > 0 && attacker.gekirinMoveId !== null) {
+    const forcedGekirin = attacker.moves.find(m => m.id === attacker.gekirinMoveId);
+    if (forcedGekirin && forcedGekirin !== move) {
+      move = forcedGekirin;
+    }
+  }
+
   // ---- 挑発チェック ----
   if (attacker.tauntTurns > 0 && move.category === 'status') {
     logFn(`${attacker.species.name}は挑発されていて変化技が出せない！`);
@@ -1515,13 +1525,33 @@ function executeMove(attacker, defender, move, logFn) {
     return;
   }
   move.pp--;
-  logFn(`${attacker.species.name}の${move.name}！`);
+  logFn(`${attacker.species.name}の${move.name}！`, { moveUse: attacker.side });
 
   if (move.callRandomMove) {
     const randomMove = pickRandomMove();
     logFn(`${randomMove.name}が飛び出した！`);
     executeMove(attacker, defender, randomMove, logFn);
     return;
+  }
+
+  // ---- であいがしら：使用したら次のターンからロック（交代で解除） ----
+  if (move.id === 4) {
+    attacker.deaigashiraLocked = true;
+  }
+
+  // ---- げきりん：強制連続使用の管理 ----
+  if (move.id === 43) {
+    if (attacker.gekirinTurns <= 0) {
+      // 新規発動：2〜3ターン継続（本ターンを含む）
+      attacker.gekirinTurns = rand(2, 3);
+      attacker.gekirinMoveId = 43;
+    }
+    attacker.gekirinTurns--;
+    if (attacker.gekirinTurns <= 0) {
+      attacker.gekirinMoveId = null;
+      // 強制ターン終了後、自分が混乱する
+      applyStatus(attacker, [100, STATUS.CONFUSE], logFn);
+    }
   }
 
   // ---- 変化技の特殊処理 ----
@@ -1581,7 +1611,7 @@ function executeMove(attacker, defender, move, logFn) {
     } else {
       logFn(`しかし、既にあくタイプは消滅している！`);
     }
-    return;
+    // 攻撃技なので、この後ダメージ計算に進む
   }
 
   // ---- こだまのさけび (491) ----
@@ -1592,7 +1622,7 @@ function executeMove(attacker, defender, move, logFn) {
     } else {
       logFn(`しかし、既にくさタイプは消滅している！`);
     }
-    return;
+    // 攻撃技なので、この後ダメージ計算に進む
   }
 
   // ---- ナナイロレーザー (482) ----
@@ -1601,8 +1631,7 @@ function executeMove(attacker, defender, move, logFn) {
     const newType = typeKeys[rand(0, typeKeys.length - 1)];
     attacker.changedType = newType;
     logFn(`${attacker.species.name}のタイプが${typeJp(newType)}に変わった！`);
-    // 変化技なのでダメージなし
-    return;
+    // 攻撃技なので、この後ダメージ計算に進む
   }
 
   // ---- フィールド設置技 ----
@@ -1944,7 +1973,7 @@ function executeMove(attacker, defender, move, logFn) {
   defender.currentHp = Math.max(0, defender.currentHp - damage);
   if (survivedByGanjou) defender.currentHp = 1;
   const actualDamageDealt = hpBeforeDamage - defender.currentHp;
-  logFn(`${defender.species.name}に${damage}のダメージ！`, { hit: defender.side });
+  logFn(`${defender.species.name}に${damage}のダメージ！`, { hit: defender.side, typeMult, moveType: move.type });
   if (isCrit) logFn('急所に当たった！');
   if (typeMult > 1) logFn('効果は抜群だ！');
   else if (typeMult < 1) logFn('効果は今ひとつのようだ…');
@@ -2024,6 +2053,10 @@ function executeMove(attacker, defender, move, logFn) {
   if (defender.currentHp <= 0) {
     defender.fainted = true;
     logFn(`${defender.species.name}は倒れた！`, { faint: defender.side });
+    // 相手を倒した場合でも、技自体は命中しているため自分のランク変化（selfRank）は発動する。
+    if (!attacker.fainted && !suppressSecondary) {
+      applyRankChange(attacker, move.selfRank, logFn);
+    }
     if (defender.ability === ABILITY.YUUBABU && !attacker.fainted) {
       if (!battleField.chemicalGasActive || defender.ability === ABILITY.KAGAKUHENKAGASU) {
         const burstDmg = Math.max(1, Math.floor(defender.maxHp / 4));
@@ -2276,8 +2309,16 @@ function weatherTerrainScoreMult(moveType, moveId) {
 }
 
 function chooseCpuAction(cpuPoke, playerPoke) {
-  const usable = cpuPoke.moves.filter((m) => m.pp > 0 && !m.locked);
-  if (usable.length === 0) return { type: 'move', move: cpuPoke.moves[0] };
+  const usable = cpuPoke.moves.filter((m) => m.pp > 0 && !m.locked && !(m.id === 4 && cpuPoke.deaigashiraLocked));
+  if (usable.length === 0) return { type: 'move', move: cpuPoke.moves.find(m => m.pp > 0) || cpuPoke.moves[0] };
+
+  // げきりん強制連続使用
+  if (cpuPoke.gekirinTurns > 0 && cpuPoke.gekirinMoveId !== null) {
+    const forcedGekirin = cpuPoke.moves.find(m => m.id === cpuPoke.gekirinMoveId);
+    if (forcedGekirin && forcedGekirin.pp > 0 && !forcedGekirin.locked) {
+      return { type: 'move', move: forcedGekirin };
+    }
+  }
 
   // アンコール強制
   if (cpuPoke.encoreTurns > 0 && cpuPoke.encoreMoveId !== null) {

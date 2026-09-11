@@ -64,6 +64,7 @@ const Net = {
       hostTeam: null,
       guestTeam: null,
     });
+    this._armDisconnectClose();
     return 'ok';
   },
 
@@ -84,7 +85,38 @@ const Net = {
       guestName: name,
       status: 'both-in',
     });
+    this._armDisconnectClose();
     return 'ok';
+  },
+
+  /* ---- 切断時に自動で部屋を閉じる設定 ----
+     ホスト・ゲストのどちらであっても、ブラウザが閉じられた／回線が切れた等で
+     切断された瞬間、Firebase側が自動的に meta/status を 'closed' にする。
+     相手はこれを監視して退出を検知する。 */
+  _armDisconnectClose() {
+    if (!this.roomRef) return;
+    try {
+      const statusRef = this.roomRef.child('meta/status');
+      statusRef.onDisconnect().set('closed');
+    } catch (e) {}
+  },
+
+  _disarmDisconnectClose() {
+    if (!this.roomRef) return;
+    try {
+      this.roomRef.child('meta/status').onDisconnect().cancel();
+    } catch (e) {}
+  },
+
+  /* ---- 部屋が閉じられた（相手が抜けた）ことを監視 ---- */
+  onRoomClosed(cb) {
+    if (!this.roomRef) return;
+    const ref = this.roomRef.child('meta/status');
+    const handler = (snap) => {
+      if (snap.val() === 'closed') cb();
+    };
+    ref.on('value', handler);
+    this._unsubs.push(() => ref.off('value', handler));
   },
 
   onGuestJoined(cb) {
@@ -207,17 +239,60 @@ const Net = {
     await this.roomRef.child('battle/guestAction').remove();
   },
 
+  /* ---- 対戦終了後の連戦/退出選択 ---- */
+  async setRematchChoice(choice) {
+    // choice: 'rematch' | 'leave'
+    if (!this.roomRef) return;
+    const path = this.isHost ? 'rematch/hostChoice' : 'rematch/guestChoice';
+    await this.roomRef.child(path).set(choice);
+  },
+
+  onOpponentRematchChoice(cb) {
+    if (!this.roomRef) return;
+    const path = this.isHost ? 'rematch/guestChoice' : 'rematch/hostChoice';
+    const ref = this.roomRef.child(path);
+    const handler = (snap) => {
+      const v = snap.val();
+      if (v) cb(v);
+    };
+    ref.on('value', handler);
+    this._unsubs.push(() => ref.off('value', handler));
+  },
+
+  async clearRematch() {
+    if (!this.roomRef) return;
+    await this.roomRef.child('rematch').remove();
+  },
+
+  // 連戦時：バトル・選出・交換フェーズのデータを次戦用にクリアする
+  async resetForNextBattle() {
+    if (!this.roomRef) return;
+    await this.roomRef.child('battle').remove();
+    await this.roomRef.child('nego').remove();
+    await this.roomRef.child('rematch').remove();
+    await this.roomRef.child('hostTeam').remove();
+    await this.roomRef.child('guestTeam').remove();
+  },
+
+  /* ---- 部屋を明示的に閉じる（相手に通知） ---- */
+  async closeRoom() {
+    if (!this.roomRef) return;
+    try { await this.roomRef.child('meta/status').set('closed'); } catch (e) {}
+  },
+
   async leave() {
     if (this.roomRef) {
       try {
+        this._disarmDisconnectClose();
+        await this.closeRoom();
         if (this.isHost) {
           await this.roomRef.remove();
         } else {
           await this.roomRef.child('meta/guestName').remove();
-          await this.roomRef.child('meta/status').set('waiting');
           await this.roomRef.child('guestTeam').remove();
           await this.roomRef.child('battle').remove();
           await this.roomRef.child('nego').remove();
+          await this.roomRef.child('rematch').remove();
         }
       } catch (e) {}
     }
@@ -275,6 +350,7 @@ function deserializePokeFromNet(d) {
     typeLockTurns: 0, typeLockType: null,
     lastUsedMoveId: null, encoreMoveId: null, encoreTurns: 0,
     utsusemiTurns: 0, infernoUsed: false,
+    deaigashiraLocked: false, gekirinTurns: 0, gekirinMoveId: null,
   };
 }
 
